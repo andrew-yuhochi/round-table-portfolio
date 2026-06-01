@@ -1,0 +1,58 @@
+# S&P 500 Research Universe — Example Template (committed to git)
+# The real config/sp500_universe.yaml (gitignored) holds all ~503 entries.
+# This example shows the required shape: snapshot_date, source, total_count, universe list.
+# Each entry must have symbol (uppercase, 1-5 chars), name, and sector (GICS).
+#
+# To build the real file: copy this template, replace with the full constituent list,
+# and update snapshot_date to the capture date.
+
+snapshot_date: '2026-06-01'
+source: 'Wikipedia — List of S&P 500 companies (https://en.wikipedia.org/wiki/List_of_S%26P_500_companies)'
+total_count: 15
+
+universe:
+  - symbol: AAPL
+    name: 'Apple Inc.'
+    sector: 'Information Technology'
+  - symbol: MSFT
+    name: 'Microsoft Corporation'
+    sector: 'Information Technology'
+  - symbol: AMZN
+    name: 'Amazon.com Inc.'
+    sector: 'Consumer Discretionary'
+  - symbol: GOOGL
+    name: 'Alphabet Inc. (Class A)'
+    sector: 'Communication Services'
+  - symbol: META
+    name: 'Meta Platforms Inc.'
+    sector: 'Communication Services'
+  - symbol: BRK.B
+    name: 'Berkshire Hathaway (Class B)'
+    sector: 'Financials'
+  - symbol: JPM
+    name: 'JPMorgan Chase & Co.'
+    sector: 'Financials'
+  - symbol: JNJ
+    name: 'Johnson & Johnson'
+    sector: 'Health Care'
+  - symbol: XOM
+    name: 'Exxon Mobil Corporation'
+    sector: 'Energy'
+  - symbol: CAT
+    name: 'Caterpillar Inc.'
+    sector: 'Industrials'
+  - symbol: PG
+    name: 'Procter & Gamble Co.'
+    sector: 'Consumer Staples'
+  - symbol: LIN
+    name: 'Linde plc'
+    sector: 'Materials'
+  - symbol: NEE
+    name: 'NextEra Energy Inc.'
+    sector: 'Utilities'
+  - symbol: PLD
+    name: 'Prologis Inc.'
+    sector: 'Real Estate'
+  - symbol: NEM
+    name: 'Newmont Corporation'
+    sector: 'Materials'
