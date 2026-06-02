@@ -27,7 +27,7 @@ from round_table_portfolio.data_tools.models import RSSEntry, RSSHeadlines
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RSS_CONFIG = (
-    Path(__file__).parent.parent.parent.parent.parent / "config" / "rss_feeds.yaml"
+    Path(__file__).parent.parent.parent.parent / "config" / "rss_feeds.yaml"
 )
 
 

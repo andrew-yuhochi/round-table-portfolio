@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 _FRED_BASE = "https://api.stlouisfed.org/fred"
 _DEFAULT_FRED_CONFIG = (
-    Path(__file__).parent.parent.parent.parent.parent / "config" / "fred_series.yaml"
+    Path(__file__).parent.parent.parent.parent / "config" / "fred_series.yaml"
 )
 
 

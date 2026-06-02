@@ -4,11 +4,16 @@
 #   WORKS:   quote(), company_news(), company_basic_financials(), company_peers()
 #   PREMIUM: stock_candles(), transcripts(), transcripts_list()
 #
-# Adaptations for free tier:
-#   get_prices():       Uses Yahoo Finance v8 API directly via requests + certifi
-#                       (yfinance library has rate-limit handling issues; bypass it).
-#                       Falls back to Finnhub quote() for a current-price-only snapshot.
-#   get_transcript():   Routes entirely to EDGAR 8-K fallback (Finnhub transcripts = premium).
+# Price source (updated 2026-06-02 — resolves Yahoo 429 under load):
+#   get_prices():  Served from the LAZY WEEKLY PRICE CACHE (price_cache.py).
+#                  Cache miss → one raw Yahoo v8 fetch per ticker (paced) → cached.
+#                  Subsequent calls that week are served from parquet — zero network.
+#                  Final fallback: Finnhub quote() for a live single-bar snapshot.
+#   get_transcript(): Routes entirely to EDGAR 8-K fallback (Finnhub transcripts = premium).
+#
+# Dead paths (yfinance batch, Stooq/pandas-datareader) removed 2026-06-02:
+#   yfinance.download() batch → 429d worse than raw Yahoo under load.
+#   Stooq via pandas-datareader → broken on Python 3.14.
 #
 # TDD Component 2, DATA-SOURCES.md §Finnhub.
 
@@ -16,13 +21,10 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-import certifi
 import finnhub
-import requests
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
@@ -34,17 +36,12 @@ from round_table_portfolio.data_tools.models import (
     FinnhubTranscript,
     FinnhubPeers,
 )
-from round_table_portfolio.data_tools.rate_limiter import FINNHUB_LIMITER, YFINANCE_LIMITER
+from round_table_portfolio.data_tools.rate_limiter import FINNHUB_LIMITER
+from round_table_portfolio.data_tools.price_cache import get_cached_prices
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-_YF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-}
 
 
 def _get_client() -> finnhub.Client:
@@ -65,87 +62,103 @@ def get_prices(
     ticker: str,
     *,
     days: int = 365,
+    week_id: Optional[str] = None,
+    all_tickers: Optional[list[str]] = None,
 ) -> FinnhubCandle:
-    """Fetch daily OHLCV candles for *ticker*.
+    """Fetch daily OHLCV candles for *ticker* from the lazy weekly price cache.
 
-    Primary: Yahoo Finance v8 API via requests + certifi (bypasses yfinance's
-    broken rate-limit handling).  Falls back to a Finnhub quote()-based
-    single-bar snapshot when Yahoo is unavailable.
+    Primary path: lazy weekly cache (price_cache.py).  On cache miss, ONE raw
+    Yahoo v8 fetch is made for *ticker* (paced), then cached to parquet.  All
+    subsequent calls for that ticker that week read from the parquet — no network.
+
+    Final fallback: Finnhub quote() for a live single-bar spot price when the
+    raw Yahoo fetch also fails.
 
     Args:
-        ticker: Uppercase ticker symbol.
-        days:   Look-back window in calendar days (default 365 for technicals).
+        ticker:      Uppercase ticker symbol.
+        days:        Look-back window in calendar days (default 365).
+        week_id:     ISO week string (e.g. "2026-W23").  Defaults to current week.
+        all_tickers: Accepted for API compatibility; not used in the lazy path.
 
     Returns:
-        FinnhubCandle with source='yfinance' (Yahoo) or 'finnhub_quote' (fallback).
+        FinnhubCandle with source='raw_yahoo' or 'finnhub_quote'.
 
     Raises:
-        RuntimeError: Both Yahoo and Finnhub quote failed (per PRD NFR #5).
+        RuntimeError: All sources failed.
     """
     ticker = ticker.upper().strip()
-    range_str = f"{days}d" if days <= 730 else "2y"
 
-    # --- Primary: Yahoo Finance v8 API ---
-    yf_error: Optional[str] = None
-    try:
-        YFINANCE_LIMITER.acquire()
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        resp = requests.get(
-            url,
-            params={"interval": "1d", "range": range_str},
-            headers=_YF_HEADERS,
-            verify=certifi.where(),
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data.get("chart", {}).get("result", [])
-        if result:
-            chart = result[0]
-            timestamps = chart.get("timestamp", [])
-            indicators = chart.get("indicators", {})
-            quote = indicators.get("quote", [{}])[0]
-            closes = [float(v) if v is not None else None for v in quote.get("close", [])]
-            highs  = [float(v) if v is not None else None for v in quote.get("high", [])]
-            lows   = [float(v) if v is not None else None for v in quote.get("low", [])]
-            opens  = [float(v) if v is not None else None for v in quote.get("open", [])]
-            vols   = [float(v) if v is not None else None for v in quote.get("volume", [])]
+    if week_id is None:
+        week_id = datetime.now(timezone.utc).strftime("%G-W%V")
 
-            # Drop rows where close is None (market-closed / pre-market rows)
-            rows = [
-                (t, c, h, l, o, v)
-                for t, c, h, l, o, v in zip(timestamps, closes, highs, lows, opens, vols)
-                if c is not None
-            ]
-            if rows:
-                ts, c, h, l, o, v = zip(*rows)
-                candle = FinnhubCandle(
-                    symbol=ticker,
-                    c=list(c), h=list(h), l=list(l),
-                    o=list(o), t=list(ts), v=list(v),
-                    s="ok", source="yfinance",
-                )
-                logger.debug("Yahoo Finance %s: %d bars", ticker, len(rows))
-                return candle
+    # --- Primary: lazy weekly price cache (raw Yahoo v8 on miss) ---
+    cache_df = get_cached_prices(ticker, week_id=week_id, days=days, all_tickers=all_tickers)
 
-        yf_error = f"Yahoo Finance returned empty chart for {ticker}"
-        logger.warning("%s", yf_error)
+    if cache_df is not None and not cache_df.empty:
+        # Source tag is stored in df.attrs by price_cache
+        source_tag = cache_df.attrs.get("source", "raw_yahoo")
 
-    except requests.RequestException as exc:
-        yf_error = str(exc)
-        logger.warning("Yahoo Finance get_prices failed for %s: %s", ticker, exc)
-    except Exception as exc:
-        yf_error = str(exc)
-        logger.warning("Yahoo Finance parse failed for %s: %s", ticker, exc)
+        # Build timestamp list from date strings (convert to unix epoch)
+        timestamps: list[int] = []
+        for date_str in cache_df.index:
+            try:
+                ts = int(datetime.strptime(str(date_str), "%Y-%m-%d")
+                         .replace(tzinfo=timezone.utc).timestamp())
+                timestamps.append(ts)
+            except Exception:
+                timestamps.append(0)
 
-    # --- Fallback: Finnhub quote() — single-bar snapshot ---
-    logger.info("get_prices %s: falling back to Finnhub quote() (Yahoo: %s)", ticker, yf_error)
+        closes = [v for v in cache_df["close"].tolist()]
+        highs  = [v if v is not None else closes[i] for i, v in enumerate(cache_df["high"].tolist())]
+        lows   = [v if v is not None else closes[i] for i, v in enumerate(cache_df["low"].tolist())]
+        opens  = [v if v is not None else closes[i] for i, v in enumerate(cache_df["open"].tolist())]
+        vols   = [v if v is not None else 0.0 for v in cache_df["volume"].tolist()]
+
+        # Drop rows where close is None
+        rows = [
+            (t, c, h, l, o, v)
+            for t, c, h, l, o, v in zip(timestamps, closes, highs, lows, opens, vols)
+            if c is not None
+        ]
+        if rows:
+            ts_l, c_l, h_l, l_l, o_l, v_l = zip(*rows)
+            candle = FinnhubCandle(
+                symbol=ticker,
+                c=list(c_l), h=list(h_l), l=list(l_l),
+                o=list(o_l), t=list(ts_l), v=list(v_l),
+                s="ok", source=source_tag,
+            )
+            logger.debug(
+                "get_prices %s: %d bars from cache (source=%s, week=%s)",
+                ticker, len(rows), source_tag, week_id,
+            )
+            return candle
+
+    cache_error = f"cache returned no valid rows for {ticker}"
+    logger.warning("get_prices %s: %s", ticker, cache_error)
+
+    # --- Final fallback: Finnhub quote() — live spot price, single bar ---
+    logger.info("get_prices %s: falling back to Finnhub quote()", ticker)
     try:
         FINNHUB_LIMITER.acquire()
         client = _get_client()
         q = client.quote(ticker)
-        # quote() returns: c (current), h (high), l (low), o (open), pc (prev close), t (ts)
         if q and q.get("c") and q.get("t"):
+            date_str = datetime.fromtimestamp(int(q["t"]), tz=timezone.utc).strftime("%Y-%m-%d")
+            import pandas as pd
+            quote_df = pd.DataFrame([{
+                "open":   float(q.get("o", q["c"])),
+                "high":   float(q.get("h", q["c"])),
+                "low":    float(q.get("l", q["c"])),
+                "close":  float(q["c"]),
+                "volume": 0.0,
+            }], index=pd.Index([date_str], name="date"))
+            quote_df.attrs["source"] = "finnhub_quote"
+
+            # Write to cache so repeat calls this week are parquet-served (0 network).
+            from round_table_portfolio.data_tools.price_cache import _save_ticker_cache
+            _save_ticker_cache(week_id, ticker, quote_df)
+
             candle = FinnhubCandle(
                 symbol=ticker,
                 c=[float(q["c"])],
@@ -153,18 +166,18 @@ def get_prices(
                 l=[float(q.get("l", q["c"]))],
                 o=[float(q.get("o", q["c"]))],
                 t=[int(q["t"])],
-                v=[0.0],  # quote() doesn't provide volume
+                v=[0.0],
                 s="ok",
                 source="finnhub_quote",
             )
-            logger.info("Finnhub quote() fallback succeeded for %s", ticker)
+            logger.info("Finnhub quote() fallback succeeded for %s — result cached", ticker)
             return candle
         raise RuntimeError(f"Finnhub quote() returned no data for {ticker}: {q}")
 
     except Exception as fh_exc:
         raise RuntimeError(
-            f"Both Yahoo Finance and Finnhub quote() failed for {ticker}. "
-            f"Yahoo error: {yf_error}. Finnhub error: {fh_exc}"
+            f"All price sources failed for {ticker}. "
+            f"Cache error: {cache_error}. Finnhub error: {fh_exc}"
         ) from fh_exc
 
 

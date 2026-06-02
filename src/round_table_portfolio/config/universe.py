@@ -42,7 +42,7 @@ GICS_SECTORS = frozenset(
 _SYMBOL_RE = re.compile(r"^[A-Z]{1,5}(\.[A-Z])?$")
 
 # Default config path relative to this file's package root
-_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent.parent.parent / "config" / "sp500_universe.yaml"
+_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent.parent / "config" / "sp500_universe.yaml"
 
 
 # ---------------------------------------------------------------------------

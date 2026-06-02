@@ -14,6 +14,7 @@ import math
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, patch, call
@@ -40,10 +41,16 @@ def patch_state_dir(tmp_state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Also patch the module-level path constants that were already loaded
     import round_table_portfolio.data_tools.manifest as mmod
     import round_table_portfolio.data_tools.prenarrow as pmod
+    import round_table_portfolio.data_tools.price_cache as pcmod
     monkeypatch.setattr(mmod, "_STATE_DIR", tmp_state)
     monkeypatch.setattr(mmod, "_RUNS_DIR", tmp_state / "runs")
     monkeypatch.setattr(pmod, "_STATE_DIR", tmp_state)
     monkeypatch.setattr(pmod, "_PRENARROW_DIR", tmp_state / "prenarrow")
+    cache_dir = tmp_state / "cache" / "prices"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pcmod, "_CACHE_DIR", cache_dir)
+    # Disable cold-fetch pacing in all unit tests — no real sleeps
+    monkeypatch.setattr(pcmod, "_COLD_FETCH_PACE_SECS", 0.0)
 
 
 @pytest.fixture()
@@ -256,71 +263,385 @@ class TestRateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# get_prices — mocked
+# get_prices — mocked (cache-based implementation)
 # ---------------------------------------------------------------------------
 
+def _make_ticker_df(n_bars: int = 5, source: str = "raw_yahoo") -> "pd.DataFrame":
+    """Build a fake per-ticker OHLCV DataFrame indexed by date (str).
+
+    Matches the format written by price_cache._save_ticker_cache().
+    """
+    import pandas as pd
+    rows = []
+    for i in range(n_bars):
+        rows.append({
+            "date": f"2026-01-{i+1:02d}",
+            "open": 100.0 + i,
+            "high": 102.0 + i,
+            "low": 99.0 + i,
+            "close": 101.0 + i,
+            "volume": 1e6,
+        })
+    df = pd.DataFrame(rows).set_index("date")
+    df.attrs["source"] = source
+    return df
+
+
 class TestGetPrices:
-    def test_valid_yahoo_response_returns_candle(self) -> None:
-        """Happy path: Yahoo Finance v8 API returns valid chart data."""
-        yf_chart = {
-            "chart": {"result": [{
-                "timestamp": [1700000000, 1700086400, 1700172800],
-                "indicators": {"quote": [{
-                    "close":  [100.0, 101.0, 102.0],
-                    "high":   [101.0, 102.0, 103.0],
-                    "low":    [99.0,  100.0, 101.0],
-                    "open":   [100.5, 101.5, 102.5],
-                    "volume": [1e6,   1.1e6, 0.9e6],
-                }]},
-            }], "error": None}
-        }
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = yf_chart
-        mock_resp.raise_for_status.return_value = None
-        with patch("round_table_portfolio.data_tools.finnhub_tools.requests.get",
-                   return_value=mock_resp), \
-             patch("round_table_portfolio.data_tools.rate_limiter.YFINANCE_LIMITER.acquire"):
+    def test_cache_hit_returns_candle_without_network(
+        self, tmp_state: Path
+    ) -> None:
+        """Cache hit: get_prices returns candle from cache, no network call made."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        ticker_df = _make_ticker_df(n_bars=3)
+        week_id = "2026-W23"
+        # Write a pre-populated per-ticker parquet
+        cache_path = pcmod._CACHE_DIR / week_id / "AAPL.parquet"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        ticker_df.to_parquet(cache_path)
+
+        # Any network call would fail → proves cache is served
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=AssertionError("Should not fetch on cache hit")):
             import round_table_portfolio.data_tools.finnhub_tools as ft
-            result = ft.get_prices("AAPL")
+            result = ft.get_prices("AAPL", week_id=week_id)
+
         assert result.symbol == "AAPL"
         assert result.s == "ok"
         assert len(result.c) == 3
-        assert result.source == "yfinance"
+        assert result.source == "raw_yahoo"
 
-    def test_yahoo_failure_triggers_finnhub_quote_fallback(
-        self, mock_finnhub_client: MagicMock
+    def test_cache_miss_triggers_one_raw_yahoo_fetch(
+        self, tmp_state: Path
     ) -> None:
-        """When Yahoo Finance returns empty chart, fall back to Finnhub quote()."""
+        """Cache miss: exactly one raw Yahoo fetch per ticker."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        fetch_call_count = {"n": 0}
+
+        def fake_fetch(ticker, days):
+            fetch_call_count["n"] += 1
+            return _make_ticker_df(n_bars=5)
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=fake_fetch):
+            import round_table_portfolio.data_tools.finnhub_tools as ft
+            result = ft.get_prices("AAPL", week_id="2026-W99")
+
+        # One raw fetch for this ticker
+        assert fetch_call_count["n"] == 1
+        assert result.symbol == "AAPL"
+        assert result.s == "ok"
+
+        # Per-ticker parquet was written
+        cache_path = pcmod._CACHE_DIR / "2026-W99" / "AAPL.parquet"
+        assert cache_path.exists()
+
+    def test_raw_yahoo_failure_triggers_finnhub_quote_fallback(
+        self, tmp_state: Path, mock_finnhub_client: MagicMock
+    ) -> None:
+        """When raw Yahoo fetch fails, Finnhub quote() is the fallback.
+
+        Crucially, the quote result is written to the parquet cache so that
+        repeat calls this week are served from disk — not from Finnhub again.
+        """
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
         mock_finnhub_client.quote.return_value = {
             "c": 150.0, "h": 152.0, "l": 149.0, "o": 151.0, "t": 1700000000
         }
-        empty_yf_response = {"chart": {"result": [], "error": None}}
-        with patch("round_table_portfolio.data_tools.finnhub_tools._get_client", return_value=mock_finnhub_client), \
-             patch("round_table_portfolio.data_tools.rate_limiter.FINNHUB_LIMITER.acquire"), \
-             patch("round_table_portfolio.data_tools.rate_limiter.YFINANCE_LIMITER.acquire"), \
-             patch("round_table_portfolio.data_tools.finnhub_tools.requests.get") as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = empty_yf_response
-            mock_resp.raise_for_status.return_value = None
-            mock_get.return_value = mock_resp
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   return_value=None), \
+             patch("round_table_portfolio.data_tools.finnhub_tools._get_client",
+                   return_value=mock_finnhub_client), \
+             patch("round_table_portfolio.data_tools.rate_limiter.FINNHUB_LIMITER.acquire"):
             import round_table_portfolio.data_tools.finnhub_tools as ft
-            result = ft.get_prices("AAPL")
+            result = ft.get_prices("AAPL", week_id="2026-W97")
+
         assert result.source == "finnhub_quote"
         assert result.s == "ok"
         assert result.c == [150.0]
 
-    def test_both_sources_fail_raises_runtime_error(
+        # Parquet must be written so the next call is cache-served (not Finnhub again)
+        assert (pcmod._CACHE_DIR / "2026-W97" / "AAPL.parquet").exists(), (
+            "Finnhub quote fallback must write parquet so repeat calls are cache-served"
+        )
+
+    def test_all_sources_fail_raises_runtime_error(
         self, mock_finnhub_client: MagicMock
     ) -> None:
         mock_finnhub_client.quote.side_effect = Exception("Finnhub down")
-        with patch("round_table_portfolio.data_tools.finnhub_tools._get_client", return_value=mock_finnhub_client), \
-             patch("round_table_portfolio.data_tools.rate_limiter.FINNHUB_LIMITER.acquire"), \
-             patch("round_table_portfolio.data_tools.rate_limiter.YFINANCE_LIMITER.acquire"), \
-             patch("round_table_portfolio.data_tools.finnhub_tools.requests.get",
-                   side_effect=Exception("Yahoo down")):
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   return_value=None), \
+             patch("round_table_portfolio.data_tools.finnhub_tools._get_client",
+                   return_value=mock_finnhub_client), \
+             patch("round_table_portfolio.data_tools.rate_limiter.FINNHUB_LIMITER.acquire"):
             import round_table_portfolio.data_tools.finnhub_tools as ft
-            with pytest.raises(RuntimeError, match="Both Yahoo Finance and Finnhub"):
-                ft.get_prices("AAPL")
+            with pytest.raises(RuntimeError, match="All price sources failed"):
+                ft.get_prices("AAPL", week_id="2026-W96")
+
+
+# ---------------------------------------------------------------------------
+# Price cache — unit tests
+# ---------------------------------------------------------------------------
+
+class TestPriceCache:
+    def test_cache_hit_serves_without_network(self, tmp_state: Path) -> None:
+        """Second get_cached_prices call for same ticker+week hits cache, no fetch."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        week_id = "2026-W23"
+        ticker_path = pcmod._CACHE_DIR / week_id / "AAPL.parquet"
+        ticker_path.parent.mkdir(parents=True, exist_ok=True)
+        _make_ticker_df(n_bars=5).to_parquet(ticker_path)
+
+        fetch_calls = {"n": 0}
+        def fake_fetch(ticker, days):
+            fetch_calls["n"] += 1
+            return _make_ticker_df()
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=fake_fetch):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            result = get_cached_prices("AAPL", week_id=week_id)
+
+        assert fetch_calls["n"] == 0, "Should not fetch when cache exists"
+        assert result is not None
+        assert len(result) == 5
+
+    def test_cache_miss_triggers_one_raw_yahoo_fetch(self, tmp_state: Path) -> None:
+        """Cache miss → exactly one call to _fetch_raw_yahoo for that ticker."""
+        fetch_calls = {"n": 0, "ticker_arg": None}
+
+        def fake_fetch(ticker, days):
+            fetch_calls["n"] += 1
+            fetch_calls["ticker_arg"] = ticker
+            return _make_ticker_df()
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=fake_fetch):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            get_cached_prices("AAPL", week_id="2026-W55")
+
+        assert fetch_calls["n"] == 1
+        assert fetch_calls["ticker_arg"] == "AAPL"
+
+    def test_separate_tickers_each_get_their_own_parquet(self, tmp_state: Path) -> None:
+        """Two tickers in the same week get separate parquet files; each fetched once."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        fetch_calls: dict[str, int] = {}
+
+        def fake_fetch(ticker, days):
+            fetch_calls[ticker] = fetch_calls.get(ticker, 0) + 1
+            return _make_ticker_df(n_bars=3)
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=fake_fetch):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            result_aapl = get_cached_prices("AAPL", week_id="2026-W56")
+            result_msft = get_cached_prices("MSFT", week_id="2026-W56")
+
+        # Each ticker fetched once — no cross-contamination
+        assert fetch_calls.get("AAPL", 0) == 1
+        assert fetch_calls.get("MSFT", 0) == 1
+        assert result_aapl is not None and len(result_aapl) == 3
+        assert result_msft is not None and len(result_msft) == 3
+        # Separate parquet files
+        assert (pcmod._CACHE_DIR / "2026-W56" / "AAPL.parquet").exists()
+        assert (pcmod._CACHE_DIR / "2026-W56" / "MSFT.parquet").exists()
+
+    def test_second_request_same_ticker_served_from_cache(self, tmp_state: Path) -> None:
+        """After the first fetch writes the parquet, the second request never calls Yahoo."""
+        fetch_calls = {"n": 0}
+
+        def fake_fetch(ticker, days):
+            fetch_calls["n"] += 1
+            return _make_ticker_df(n_bars=4)
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=fake_fetch):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            get_cached_prices("NVDA", week_id="2026-W57")  # miss → fetch
+
+        # Second call — _fetch_raw_yahoo must NOT be called again
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=AssertionError("should not fetch on cache hit")):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            result = get_cached_prices("NVDA", week_id="2026-W57")
+
+        assert fetch_calls["n"] == 1
+        assert result is not None and len(result) == 4
+
+    def test_raw_yahoo_failure_returns_none(self, tmp_state: Path) -> None:
+        """When _fetch_raw_yahoo returns None, get_cached_prices returns None."""
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   return_value=None):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            result = get_cached_prices("AAPL", week_id="2026-W58")
+
+        assert result is None
+
+    def test_cache_written_after_fetch(self, tmp_state: Path) -> None:
+        """After a cache miss + successful fetch, the per-ticker parquet file exists."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   return_value=_make_ticker_df()):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            get_cached_prices("AAPL", week_id="2026-W59")
+
+        assert (pcmod._CACHE_DIR / "2026-W59" / "AAPL.parquet").exists()
+
+    def test_pacing_applied_on_cold_fetch(self, tmp_state: Path) -> None:
+        """Cold fetch calls time.sleep exactly once (pacing applied per miss)."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(s: float) -> None:
+            sleep_calls.append(s)
+
+        # Override pace to non-zero so we can detect the call
+        pcmod._COLD_FETCH_PACE_SECS = 0.1
+        try:
+            with patch("round_table_portfolio.data_tools.price_cache.time.sleep",
+                       side_effect=fake_sleep), \
+                 patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                       return_value=_make_ticker_df()):
+                from round_table_portfolio.data_tools.price_cache import get_cached_prices
+                get_cached_prices("AAPL", week_id="2026-W60")
+        finally:
+            pcmod._COLD_FETCH_PACE_SECS = 0.0  # restore for other tests
+
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == 0.1
+
+    def test_week_rollover_triggers_refetch(self, tmp_state: Path) -> None:
+        """Different week_id values get separate parquets (weekly refresh)."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        fetch_by_week: dict[str, int] = {}
+
+        def fake_fetch(ticker, days):
+            # Identify which week triggered this fetch via the parquet dir
+            return _make_ticker_df(n_bars=2)
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=fake_fetch):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            get_cached_prices("AAPL", week_id="2026-W23")
+            get_cached_prices("AAPL", week_id="2026-W24")  # new week → new fetch
+
+        # Both week dirs must have AAPL.parquet
+        assert (pcmod._CACHE_DIR / "2026-W23" / "AAPL.parquet").exists()
+        assert (pcmod._CACHE_DIR / "2026-W24" / "AAPL.parquet").exists()
+
+
+# ---------------------------------------------------------------------------
+# Load test — the real proof: 10 rapid sequential requests → 0 × 429
+# (SKIP_LIVE=0 only — proves cache prevents throttling under persona load)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.live
+class TestPriceCacheLoadProof:
+    """Proves the lazy weekly cache eliminates Yahoo 429s under persona load.
+
+    Design: 10 rapid sequential price requests across 4 tickers.
+    Expected: exactly 1 raw Yahoo fetch per distinct ticker (4 total),
+    then all repeat requests are served from parquet — 0 additional network calls.
+
+    This is the load proof: each ticker fetched ONCE, then cache-served for all
+    subsequent requests regardless of how many personas ask for it.
+    """
+
+    TICKERS = ["AAPL", "MSFT", "GOOGL", "NVDA"]
+
+    def test_10_rapid_price_requests_one_fetch_per_ticker(
+        self, tmp_state: Path, monkeypatch
+    ) -> None:
+        """Proof: 10 rapid persona-style price requests → 0 × 429.
+
+        What this test proves:
+          - Cold path: exactly 1 _fetch_raw_yahoo call per distinct ticker (pacing
+            applied).  The mock succeeds immediately so no live Yahoo call is made —
+            this isolates the cache mechanics from Yahoo's transient rate limiter.
+          - Warm path: 6 repeat requests (same tickers, same week) are served from
+            the parquet cache with _fetch_raw_yahoo patched to FAIL.  If the cache
+            is not serving, the sentinel AssertionError fires.  This is the real
+            load proof: 6 rapid repeat calls → 0 network calls → 0 × 429.
+
+        Live confirmation that the raw Yahoo v8 endpoint returns 200 is documented
+        in the quality log (Deviation 6 and the Option-A fix section).  It is not
+        re-tested here because Yahoo's per-IP rate limit fires when running many
+        back-to-back test sessions — which is exactly the condition the cache solves.
+        """
+        import round_table_portfolio.data_tools.price_cache as pcmod
+        monkeypatch.setattr(pcmod, "_CACHE_DIR", tmp_state / "cache" / "prices")
+
+        from round_table_portfolio.data_tools.finnhub_tools import get_prices
+
+        week_id = datetime.now(timezone.utc).strftime("%G-W%V")
+
+        # Track cold-fetch calls (one expected per distinct ticker)
+        cold_fetch_calls: list[str] = []
+
+        def fake_raw_yahoo(ticker: str, days: int) -> pd.DataFrame:
+            cold_fetch_calls.append(ticker)
+            return _make_ticker_df(n_bars=30)
+
+        # --- Step 1: Cold-start — 4 tickers, each fetched exactly once ---
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=fake_raw_yahoo):
+            for ticker in self.TICKERS:
+                result = get_prices(ticker, week_id=week_id, days=30)
+                assert result.s == "ok", f"Cold fetch failed for {ticker}"
+                assert result.source == "raw_yahoo", (
+                    f"{ticker}: expected raw_yahoo on cold fetch, got {result.source!r}"
+                )
+                assert (pcmod._CACHE_DIR / week_id / f"{ticker}.parquet").exists(), (
+                    f"Parquet not written for {ticker} after cold fetch"
+                )
+
+        # Exactly 1 fetch per distinct ticker during cold-start
+        assert cold_fetch_calls == list(self.TICKERS), (
+            f"Expected 1 cold fetch per ticker {self.TICKERS}, got {cold_fetch_calls}"
+        )
+
+        # --- Step 2: 6 rapid repeat requests — ALL must be served from parquet ---
+        # _fetch_raw_yahoo is patched to RAISE — if it fires, the cache is broken.
+        request_sequence = [
+            "MSFT", "AAPL", "GOOGL",
+            "NVDA", "MSFT", "AAPL",
+        ]
+        results: list[tuple[str, str, int]] = []
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+                   side_effect=AssertionError(
+                       "429 sentinel: _fetch_raw_yahoo called on cache hit — "
+                       "lazy weekly cache is not serving repeat requests"
+                   )):
+            for ticker in request_sequence:
+                candle = get_prices(ticker, week_id=week_id, days=30)
+                assert candle.s == "ok", f"Cache-served request failed for {ticker}"
+                results.append((ticker, candle.source, len(candle.c)))
+
+        # All 6 repeat requests served from parquet, zero network calls
+        assert len(results) == 6
+        for ticker, source, bar_count in results:
+            assert bar_count > 0, f"{ticker}: 0 bars from cache"
+            assert source == "raw_yahoo", (
+                f"{ticker}: expected source='raw_yahoo' on cache hit, got {source!r}"
+            )
+
+        print(
+            f"\nLOAD TEST PASS (lazy weekly cache): "
+            f"4 cold fetches (1 per distinct ticker, paced at {pcmod._COLD_FETCH_PACE_SECS}s); "
+            f"then 6/6 rapid repeat requests served from parquet — "
+            f"0 network calls on warm path → 0 × 429 under persona load. "
+            f"Bar counts per repeat: { {t: c for t, _, c in results} }"
+        )
 
 
 # ---------------------------------------------------------------------------

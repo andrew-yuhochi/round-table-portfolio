@@ -23,8 +23,9 @@ edgartools==5.33.0
 # RSS parsing
 feedparser==6.0.11
 
-# Prices (primary: Finnhub; fallback: yfinance)
-yfinance==0.2.54
+# Prices — raw Yahoo Finance v8 API via requests + certifi (lazy weekly cache).
+# yfinance and pandas-datareader removed 2026-06-02: yfinance 429d worse than raw
+# Yahoo under load; pandas-datareader/Stooq broken on Python 3.14.  Neither is used.
 
 # Data manipulation (required by yfinance, edgartools, pandas-ta-classic)
 pandas==2.2.3
