@@ -1,0 +1,29 @@
+# persona_budgets.example.yaml — Example template for persona_budgets.yaml (committed to git)
+# The real config/persona_budgets.yaml (gitignored by default, negation-unignored in mega-repo)
+# holds per-persona tool-call and web-search budgets enforced by the orchestrator.
+# This example shows the required shape: defaults block + per-persona overrides.
+#
+# To configure: copy to persona_budgets.yaml, tune max_turns / max_web_searches /
+# max_data_tool_calls per persona to match your subscription tier and runtime budget.
+# Personas not listed here inherit the defaults block.
+
+defaults:
+  max_turns: 12
+  max_web_searches: 8
+  max_data_tool_calls: 15
+
+personas:
+  value:
+    max_turns: 12
+    max_web_searches: 6
+    max_data_tool_calls: 18   # value needs more EDGAR/fundamentals calls
+
+  growth:
+    max_turns: 12
+    max_web_searches: 10
+    max_data_tool_calls: 15
+
+  technical:
+    max_turns: 12
+    max_web_searches: 4
+    max_data_tool_calls: 20   # technical needs prices for many tickers

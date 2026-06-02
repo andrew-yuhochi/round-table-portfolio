@@ -1,0 +1,19 @@
+# fred_series.example.yaml — Example template for fred_series.yaml (committed to git)
+# The real config/fred_series.yaml (gitignored by default, negation-unignored in mega-repo)
+# holds all production series IDs used by get_macro_series().
+# This example shows the required shape: a list of FRED series IDs + descriptions.
+#
+# To configure: copy to fred_series.yaml, add/remove series as needed.
+# Series IDs must be valid FRED identifiers (see https://fred.stlouisfed.org).
+
+series:
+  - id: FEDFUNDS
+    description: Federal Funds Rate (daily, %)
+  - id: GS10
+    description: 10-Year Treasury Constant Maturity Rate (daily, %)
+  - id: CPIAUCSL
+    description: CPI All Urban Consumers (monthly, seasonally adjusted)
+  - id: UNRATE
+    description: Unemployment Rate (monthly, %)
+  - id: VIXCLS
+    description: CBOE Volatility Index (VIX) (daily)

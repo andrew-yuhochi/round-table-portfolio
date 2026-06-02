@@ -26,6 +26,11 @@ config/*.toml
 # GitHub publish whitelist (.github-publish.txt lists only *.example.yaml),
 # so it stays off the public GitHub repo.
 !config/sp500_universe.yaml
+# Structural config files (no secrets/PII) — version-controlled in the mega-repo,
+# NOT on the GitHub publish whitelist (only *.example.yaml are published).
+!config/fred_series.yaml
+!config/rss_feeds.yaml
+!config/persona_budgets.yaml
 
 # OS / editor
 .DS_Store

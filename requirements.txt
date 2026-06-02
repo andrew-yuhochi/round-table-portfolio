@@ -1,9 +1,44 @@
 # round-table-portfolio — pinned dependencies
 # SQLite is stdlib (no pip install needed).
-# Data-source libraries will be added as TASK-M1-003 is implemented.
+# Updated by TASK-M1-003 (data-tool layer).
 
 # YAML parsing
 pyyaml==6.0.3
+
+# Environment / config
+python-dotenv==1.1.0
+
+# Data validation
+pydantic==2.13.4
+
+# Finnhub API client
+finnhub-python==2.4.21
+
+# FRED API client
+fredapi==0.5.2
+
+# SEC EDGAR (edgartools — MIT-licensed, updated May 2026)
+edgartools==5.33.0
+
+# RSS parsing
+feedparser==6.0.11
+
+# Prices (primary: Finnhub; fallback: yfinance)
+yfinance==0.2.54
+
+# Data manipulation (required by yfinance, edgartools, pandas-ta-classic)
+pandas==2.2.3
+
+# Technical indicators — MUST be pandas-ta-classic, NOT pandas-ta
+# Import name: import pandas_ta_classic as ta
+# See DATA-SOURCES.md §pandas-ta-classic for the critical naming note.
+pandas-ta-classic==0.6.20
+
+# HTTP (used by finnhub-python, yfinance internally)
+requests==2.32.3
+
+# Parquet cache (pre_narrow result storage)
+pyarrow==24.0.0
 
 # Testing
 coverage==7.14.1

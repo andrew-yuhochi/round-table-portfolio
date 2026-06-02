@@ -1,0 +1,16 @@
+# rss_feeds.example.yaml — Example template for rss_feeds.yaml (committed to git)
+# The real config/rss_feeds.yaml (gitignored by default, negation-unignored in mega-repo)
+# holds the production RSS feed URLs used by get_rss_headlines().
+# This example shows the required shape: a list of feed URLs + display names.
+#
+# To configure: copy to rss_feeds.yaml, replace URLs with feeds you want to monitor.
+# Note: most financial RSS publishers require a browser-like User-Agent header —
+# the rss_tools fetcher handles this automatically.
+
+feeds:
+  - url: https://feeds.marketwatch.com/marketwatch/topstories/
+    name: MarketWatch Top Stories
+  - url: https://finance.yahoo.com/news/rssindex
+    name: Yahoo Finance News
+  - url: https://www.cnbc.com/id/10000664/device/rss/rss.html
+    name: CNBC Economy
