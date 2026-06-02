@@ -518,6 +518,19 @@ class TestPriceCache:
         assert len(sleep_calls) == 1
         assert sleep_calls[0] == 0.1
 
+    def test_default_pace_is_one_second(self) -> None:
+        """Module constant confirms 1 s default pacing (not old 0.5 s value)."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+        # The autouse fixture zeroes this for unit tests — check the original module default.
+        # We re-import the constant's documented value from the source, not the patched attr.
+        assert pcmod._COLD_FETCH_PACE_SECS == 0.0  # fixture has zeroed it — that's fine
+        # The documented default before fixture override is 1.0; verify via module source.
+        import importlib, inspect
+        src = inspect.getsource(pcmod)
+        assert "_COLD_FETCH_PACE_SECS: float = 1.0" in src, (
+            "Default pace must be 1.0 s (not old 0.5 s) per the historical-price fix spec"
+        )
+
     def test_week_rollover_triggers_refetch(self, tmp_state: Path) -> None:
         """Different week_id values get separate parquets (weekly refresh)."""
         import round_table_portfolio.data_tools.price_cache as pcmod
@@ -537,6 +550,148 @@ class TestPriceCache:
         # Both week dirs must have AAPL.parquet
         assert (pcmod._CACHE_DIR / "2026-W23" / "AAPL.parquet").exists()
         assert (pcmod._CACHE_DIR / "2026-W24" / "AAPL.parquet").exists()
+
+
+# ---------------------------------------------------------------------------
+# Yahoo v8 chart endpoint — range=2y parsing + 429 backoff
+# ---------------------------------------------------------------------------
+
+def _make_yahoo_chart_payload(ticker: str, n_bars: int = 251) -> dict:
+    """Minimal Yahoo v8/chart JSON payload with *n_bars* daily bars."""
+    import time as _time
+    base_ts = 1700000000
+    timestamps = [base_ts + i * 86400 for i in range(n_bars)]
+    closes = [100.0 + i * 0.1 for i in range(n_bars)]
+    highs  = [c + 1.0 for c in closes]
+    lows   = [c - 1.0 for c in closes]
+    opens  = [c + 0.2 for c in closes]
+    vols   = [1_000_000] * n_bars
+    return {
+        "chart": {
+            "result": [{
+                "timestamp": timestamps,
+                "indicators": {
+                    "quote": [{"open": opens, "high": highs, "low": lows,
+                               "close": closes, "volume": vols}],
+                    "adjclose": [{"adjclose": closes}],
+                },
+            }],
+            "error": None,
+        }
+    }
+
+
+class TestYahooChartEndpoint:
+    """Unit tests for the raw Yahoo v8 chart fetch — mocks requests.get."""
+
+    def _mock_response(self, payload: dict, status_code: int = 200) -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json.return_value = payload
+        if status_code >= 400:
+            import requests as _req
+            resp.raise_for_status.side_effect = _req.HTTPError(
+                f"HTTP {status_code}", response=resp
+            )
+        else:
+            resp.raise_for_status.return_value = None
+        return resp
+
+    def test_chart_payload_parsed_into_250_plus_bars(self) -> None:
+        """range=2y response with 251 bars parses into a ≥250-row DataFrame."""
+        payload = _make_yahoo_chart_payload("AAPL", n_bars=251)
+        mock_resp = self._mock_response(payload)
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   return_value=mock_resp):
+            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
+            df = _fetch_raw_yahoo("AAPL", days=730)
+        assert df is not None
+        assert len(df) >= 250, f"Expected ≥250 bars, got {len(df)}"
+        assert set(df.columns) >= {"open", "high", "low", "close", "volume"}
+        assert df.attrs.get("source") == "raw_yahoo"
+
+    def test_range_param_sent_not_period_timestamps(self) -> None:
+        """Confirms the request uses range=2y rather than period1/period2."""
+        payload = _make_yahoo_chart_payload("AAPL", n_bars=10)
+        mock_resp = self._mock_response(payload)
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   return_value=mock_resp) as mock_get:
+            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
+            _fetch_raw_yahoo("AAPL", days=730)
+        _, kwargs = mock_get.call_args
+        sent_params = kwargs.get("params", {})
+        assert sent_params.get("range") == "2y", (
+            f"Expected range=2y param, got params={sent_params}"
+        )
+        assert sent_params.get("interval") == "1d"
+        assert "period1" not in sent_params, "Old period1/period2 form must not be used"
+        assert "period2" not in sent_params
+
+    def test_429_triggers_exponential_backoff_and_retry(self) -> None:
+        """First call returns 429; second call returns 200 with data — retry succeeds."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        payload = _make_yahoo_chart_payload("AAPL", n_bars=10)
+        resp_429 = self._mock_response({}, status_code=429)
+        resp_200 = self._mock_response(payload, status_code=200)
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(s: float) -> None:
+            sleep_calls.append(s)
+
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   side_effect=[resp_429, resp_200]), \
+             patch("round_table_portfolio.data_tools.price_cache.time.sleep",
+                   side_effect=fake_sleep):
+            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
+            df = _fetch_raw_yahoo("AAPL", days=730)
+
+        assert df is not None, "Should succeed after retry"
+        assert len(df) == 10
+        # One backoff sleep was triggered (base delay × 2^0 = 4s or patched equivalent)
+        assert len(sleep_calls) >= 1, "Expected at least one backoff sleep on 429"
+
+    def test_429_exhausted_returns_none(self) -> None:
+        """When all retries are exhausted by 429s, _fetch_raw_yahoo returns None."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        # More 429s than retries
+        resp_429 = self._mock_response({}, status_code=429)
+        n_attempts = pcmod._YAHOO_429_MAX_RETRIES + 1
+
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   return_value=resp_429), \
+             patch("round_table_portfolio.data_tools.price_cache.time.sleep"):
+            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
+            df = _fetch_raw_yahoo("AAPL", days=730)
+
+        assert df is None, "Should return None after retries exhausted"
+
+    def test_cache_hit_serves_without_network_after_chart_fetch(
+        self, tmp_state: Path
+    ) -> None:
+        """After a cold chart fetch writes parquet, re-request serves from cache."""
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        payload = _make_yahoo_chart_payload("AAPL", n_bars=251)
+        mock_resp = self._mock_response(payload)
+
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   return_value=mock_resp):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            result1 = get_cached_prices("AAPL", week_id="2026-W70", _pace=False)
+
+        assert result1 is not None and len(result1) >= 250
+
+        # Second request: requests.get must NOT be called (cache serves it)
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   side_effect=AssertionError("cache not serving — live fetch fired")):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            result2 = get_cached_prices("AAPL", week_id="2026-W70", _pace=False)
+
+        assert result2 is not None
+        assert len(result2) == len(result1)
 
 
 # ---------------------------------------------------------------------------

@@ -6,9 +6,13 @@
 # that ticker that week (from any persona) is served from the parquet file —
 # zero network calls.
 #
-# Cold-path pacing: a short sleep between successive cold fetches keeps the
+# Cold-path pacing: a 1 s sleep between successive cold fetches keeps the
 # cold path itself under Yahoo's per-IP rate limit.  The pacing is applied
 # ONLY on cache misses (warm reads have no sleep).
+#
+# 429 retry: _fetch_raw_yahoo retries with exponential backoff (2 retries,
+# base delay 4 s) before returning None so the Finnhub fallback kicks in only
+# on a genuine hard failure — not on a transient rate-limit blip.
 #
 # Cache key: ISO week (e.g. "2026-W23") + ticker.
 # Cache location: state/cache/prices/<week_id>/<ticker>.parquet
@@ -21,7 +25,7 @@
 #   - yfinance.download() batch (got 429d worse than raw)
 #   - Stooq via pandas-datareader (broken on Python 3.14)
 #
-# Per TDD Component 2 / founder Option A directive 2026-06-02.
+# Per TDD Component 2 / research-analyst-confirmed fix 2026-06-02.
 
 from __future__ import annotations
 
@@ -42,9 +46,10 @@ _STATE_DIR = Path(os.environ.get("STATE_DIR", "state"))
 _CACHE_DIR = _STATE_DIR / "cache" / "prices"
 
 # Seconds to sleep between cold per-ticker fetches — keeps cold path under Yahoo limit.
-_COLD_FETCH_PACE_SECS: float = 0.5
+_COLD_FETCH_PACE_SECS: float = 1.0
 
-# Yahoo Finance v8 chart endpoint — confirmed working 2026-06-02.
+# Yahoo Finance v8 chart endpoint — range=2y&interval=1d confirmed working 2026-06-02:
+# 251 bars/call, 10 rapid requests, zero 429s (research-analyst live test).
 _YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 _YAHOO_HEADERS = {
     "User-Agent": (
@@ -54,6 +59,10 @@ _YAHOO_HEADERS = {
     ),
     "Accept": "application/json",
 }
+
+# 429 retry config: two retries with exponential backoff (4 s, 8 s).
+_YAHOO_429_MAX_RETRIES: int = 2
+_YAHOO_429_BASE_DELAY_SECS: float = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -93,38 +102,52 @@ def _save_ticker_cache(week_id: str, ticker: str, df: pd.DataFrame) -> None:
 def _fetch_raw_yahoo(ticker: str, days: int) -> Optional[pd.DataFrame]:
     """Fetch OHLCV for *ticker* from the Yahoo Finance v8 chart endpoint.
 
+    Uses range=2y&interval=1d — confirmed to return ~504 daily bars with zero
+    429s at research-analyst live-test pace (2026-06-02).  The *days* parameter
+    is accepted for API compatibility but the range param drives lookback.
+
+    Retries up to _YAHOO_429_MAX_RETRIES times on HTTP 429 with exponential
+    backoff before returning None (which triggers the Finnhub quote() fallback).
+
     Returns a DataFrame indexed by date (str "YYYY-MM-DD") with columns
-    open/high/low/close/volume, or None on any failure.
-
-    Confirmed working 2026-06-02 on Python 3.14 / macOS with certifi bundle.
+    open/high/low/close/volume, or None on any hard failure.
     """
-    end_ts = int(datetime.now(timezone.utc).timestamp())
-    start_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-
     url = _YAHOO_CHART_URL.format(ticker=ticker)
-    params = {
-        "period1": start_ts,
-        "period2": end_ts,
-        "interval": "1d",
-        "events": "history",
-        "includeAdjustedClose": "true",
-    }
+    params = {"range": "2y", "interval": "1d"}
 
-    try:
-        resp = requests.get(
-            url,
-            params=params,
-            headers=_YAHOO_HEADERS,
-            verify=certifi.where(),
-            timeout=15,
-        )
-        resp.raise_for_status()
-    except requests.HTTPError as exc:
-        logger.warning("price_cache: Yahoo HTTP error for %s: %s", ticker, exc)
-        return None
-    except requests.RequestException as exc:
-        logger.warning("price_cache: Yahoo network error for %s: %s", ticker, exc)
-        return None
+    attempt = 0
+    while True:
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                headers=_YAHOO_HEADERS,
+                verify=certifi.where(),
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                if attempt < _YAHOO_429_MAX_RETRIES:
+                    delay = _YAHOO_429_BASE_DELAY_SECS * (2 ** attempt)
+                    logger.warning(
+                        "price_cache: Yahoo 429 for %s — retry %d/%d in %.0fs",
+                        ticker, attempt + 1, _YAHOO_429_MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                logger.warning(
+                    "price_cache: Yahoo 429 for %s — exhausted %d retries, giving up",
+                    ticker, _YAHOO_429_MAX_RETRIES,
+                )
+                return None
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            logger.warning("price_cache: Yahoo HTTP error for %s: %s", ticker, exc)
+            return None
+        except requests.RequestException as exc:
+            logger.warning("price_cache: Yahoo network error for %s: %s", ticker, exc)
+            return None
+        break  # successful response — exit retry loop
 
     try:
         payload = resp.json()
