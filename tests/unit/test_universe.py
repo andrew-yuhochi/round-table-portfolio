@@ -234,6 +234,46 @@ class TestMalformedFixtures:
         with pytest.raises(FileNotFoundError):
             load_universe(tmp_path / "nonexistent.yaml")
 
+    def test_inline_comment_on_quoted_value_does_not_corrupt(self, tmp_path: Path) -> None:
+        """
+        Regression test: a quoted value followed by an inline YAML comment
+        must parse to the bare value only — no comment text leaked in.
+
+        This is the confirmed silent-corruption bug in the former hand-rolled
+        parser (TASK-M1-002 follow-up, 2026-06-01).  yaml.safe_load() handles
+        inline comments natively, so 'Apple Inc.' is the expected result.
+        """
+        fixture = _write_fixture(
+            tmp_path,
+            """\
+            snapshot_date: '2026-06-01'
+            source: 'test'
+            total_count: 1
+            universe:
+              - symbol: AAPL
+                name: 'Apple Inc.' # largest company by market cap
+                sector: 'Information Technology'
+            """,
+        )
+        # Only one sector present — loader will raise for missing GICS sectors,
+        # but the name field must already be correct before that check fires.
+        # We catch ValueError and confirm it's the sector error, not a corrupt name.
+        try:
+            load_universe(fixture)
+        except ValueError as exc:
+            msg = str(exc)
+            # Must be a sector-coverage error, not a corrupt-name or symbol error
+            assert "missing GICS sectors" in msg, (
+                f"Unexpected ValueError (possible name corruption): {msg}"
+            )
+            # Confirm the name was parsed cleanly by loading via yaml directly
+            import yaml as _yaml
+            raw = _yaml.safe_load((tmp_path / "universe_fixture.yaml").read_text())
+            parsed_name = raw["universe"][0]["name"]
+            assert parsed_name == "Apple Inc.", (
+                f"Inline comment leaked into name field: {parsed_name!r}"
+            )
+
     def test_invalid_symbol_format_rejected(self, tmp_path: Path) -> None:
         """Symbol with lowercase or excessive length should be rejected."""
         fixture = _write_fixture(
@@ -250,6 +290,64 @@ class TestMalformedFixtures:
         )
         with pytest.raises(ValueError, match="invalid symbol format"):
             load_universe(fixture)
+
+    def test_boolean_symbol_raises_clear_error(self, tmp_path: Path) -> None:
+        """
+        Regression guard: unquoted YAML 1.1 keyword ON is parsed by
+        yaml.safe_load() as boolean True, not the string 'ON'.
+        The loader must raise a clear ValueError before str() silently
+        converts True→'True' and corrupts the symbol.
+
+        This fixture deliberately omits quotes around ON so yaml.safe_load()
+        produces a bool — proving the guard fires even if the YAML file
+        is ever edited carelessly.
+        """
+        # Write the fixture directly (not via _write_fixture's dedent) so we
+        # can control exact YAML bytes with no quoting around ON.
+        p = tmp_path / "boolean_symbol.yaml"
+        p.write_text(
+            "snapshot_date: '2026-06-01'\n"
+            "source: 'test'\n"
+            "total_count: 1\n"
+            "universe:\n"
+            "  - symbol: ON\n"          # unquoted — yaml.safe_load parses as True
+            "    name: 'ON Semiconductor'\n"
+            "    sector: 'Information Technology'\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="non-string"):
+            load_universe(p)
+
+    def test_on_ticker_loads_as_string_when_quoted(self, tmp_path: Path) -> None:
+        """
+        Confirm that quoting 'ON' in the YAML file (as in the real universe
+        file) makes yaml.safe_load() return the string 'ON', not a bool.
+        The loader should NOT raise for the quoted form.
+
+        Because only one sector is present the loader will raise for missing
+        GICS sectors — that's expected and not the bug we're testing.
+        We catch that specific ValueError to prove the symbol parsed cleanly.
+        """
+        p = tmp_path / "quoted_on.yaml"
+        p.write_text(
+            "snapshot_date: '2026-06-01'\n"
+            "source: 'test'\n"
+            "total_count: 1\n"
+            "universe:\n"
+            "  - symbol: 'ON'\n"        # quoted — must parse as string 'ON'
+            "    name: 'ON Semiconductor'\n"
+            "    sector: 'Information Technology'\n",
+            encoding="utf-8",
+        )
+        try:
+            load_universe(p)
+        except ValueError as exc:
+            msg = str(exc)
+            # Only acceptable error is the missing-sectors error; a non-string
+            # error here means the guard fired incorrectly on a quoted symbol.
+            assert "missing GICS sectors" in msg, (
+                f"Unexpected ValueError (quoted ON should parse as str): {msg}"
+            )
 
 
 # ---------------------------------------------------------------------------

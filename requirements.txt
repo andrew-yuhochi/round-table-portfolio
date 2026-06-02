@@ -2,6 +2,9 @@
 # SQLite is stdlib (no pip install needed).
 # Data-source libraries will be added as TASK-M1-003 is implemented.
 
+# YAML parsing
+pyyaml==6.0.3
+
 # Testing
 coverage==7.14.1
 iniconfig==2.3.0

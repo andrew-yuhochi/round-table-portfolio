@@ -21,6 +21,11 @@ config/*.yaml
 config/*.toml
 !config/*.example.yaml
 !config/streamlit_theme.toml
+# sp500_universe.yaml is public S&P 500 data (no PII) — version-controlled in
+# the mega-repo so the loader works on a fresh checkout. It is NOT on the
+# GitHub publish whitelist (.github-publish.txt lists only *.example.yaml),
+# so it stays off the public GitHub repo.
+!config/sp500_universe.yaml
 
 # OS / editor
 .DS_Store

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -57,72 +59,48 @@ class TickerEntry:
 
 
 # ---------------------------------------------------------------------------
-# YAML parsing (stdlib-only — no PyYAML dependency at PoC)
+# YAML parsing — delegates to yaml.safe_load() (PyYAML)
 # ---------------------------------------------------------------------------
 
 def _parse_yaml_universe(path: Path) -> tuple[str, list[dict[str, str]]]:
     """
-    Minimal hand-rolled parser for the sp500_universe.yaml structure.
+    Parse sp500_universe.yaml using yaml.safe_load().
 
     Returns (snapshot_date, list of raw dicts with symbol/name/sector keys).
-    Raises ValueError on structural problems caught during parsing.
+    Raises ValueError if the top-level structure is missing required keys.
     """
-    text = path.read_text(encoding="utf-8")
-    lines = text.splitlines()
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
 
-    snapshot_date: str = ""
-    raw_entries: list[dict[str, str]] = []
-    current: dict[str, str] | None = None
-    in_universe = False
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a YAML mapping at the top level of {path}")
 
-    for lineno, raw_line in enumerate(lines, start=1):
-        line = raw_line.rstrip()
-
-        # Skip comments and blank lines
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        # Detect "universe:" block start
-        if re.match(r"^universe\s*:", line):
-            in_universe = True
-            continue
-
-        # Top-level scalar fields (before universe block)
-        if not in_universe:
-            m = re.match(r"^(\w+)\s*:\s*(.+)$", line)
-            if m:
-                key, val = m.group(1), m.group(2).strip().strip("'\"")
-                if key == "snapshot_date":
-                    snapshot_date = val
-            continue
-
-        # Inside universe block
-        # New entry marker: "  - <key>: <value>" — any field may start the entry
-        m_entry = re.match(r"^\s+-\s+(\w+)\s*:\s*(.+)$", line)
-        if m_entry:
-            if current is not None:
-                raw_entries.append(current)
-            key = m_entry.group(1).strip()
-            val = m_entry.group(2).strip().strip("'\"")
-            current = {key: val}
-            continue
-
-        # Continuation field of current entry: "    name: ..." or "    sector: ..."
-        m_field = re.match(r"^\s+(\w+)\s*:\s*(.+)$", line)
-        if m_field and current is not None:
-            key = m_field.group(1).strip()
-            val = m_field.group(2).strip().strip("'\"")
-            current[key] = val
-
-    # Flush last entry
-    if current is not None:
-        raw_entries.append(current)
-
+    snapshot_date = str(data.get("snapshot_date", "")).strip()
     if not snapshot_date:
         raise ValueError(f"Missing 'snapshot_date' field in {path}")
 
-    return snapshot_date, raw_entries
+    raw_entries = data.get("universe", [])
+    if not isinstance(raw_entries, list):
+        raise ValueError(f"Expected 'universe' to be a list in {path}")
+
+    # Guard against PyYAML 1.1 boolean coercion: unquoted YAML keywords like
+    # ON, OFF, YES, NO, TRUE, FALSE are parsed as bool by yaml.safe_load().
+    # Detect this BEFORE str(v) silently converts True→"True" / False→"False".
+    normalised: list[dict[str, str]] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        for field in ("symbol", "name", "sector"):
+            raw_val = entry.get(field)
+            if raw_val is not None and not isinstance(raw_val, str):
+                raise ValueError(
+                    f"Field '{field}' parsed as non-string "
+                    f"(YAML keyword coercion?): {raw_val!r} "
+                    f"(type={type(raw_val).__name__}). "
+                    f"Quote the value in the YAML file to fix this."
+                )
+        normalised.append({k: str(v).strip() for k, v in entry.items()})
+
+    return snapshot_date, normalised
 
 
 # ---------------------------------------------------------------------------
