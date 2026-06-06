@@ -173,6 +173,18 @@ def validate_persona_definition(path: str | Path) -> PersonaValidationResult:
                 "`## ROUND 1 OUTPUT SCHEMA` omits `counterfactual_portfolio` "
                 "(Critical Component #2 anchor)."
             )
+        # The explicit-CASH fully-invested clause (Layer 1 of the three-layer
+        # fully-invested rule, TASK-M2-001). The counterfactual_portfolio must
+        # carry an explicit `CASH` entry so positions + CASH = exactly 100% by
+        # design — not a residual the framework computes after the fact. The
+        # quoted JSON key `"CASH"` is the deterministic conformance marker.
+        elif '"CASH"' not in r1:
+            violations.append(
+                "`## ROUND 1 OUTPUT SCHEMA` omits the explicit `\"CASH\"` entry in "
+                "`counterfactual_portfolio`; the book must be fully specified so "
+                "positions + CASH = 100% by design (Layer 1, three-layer "
+                "fully-invested rule — TASK-M2-001)."
+            )
 
     # --- RESEARCH OUTPUT SCHEMA must include shortlist + cluster ----------
     ros = sections.get("RESEARCH OUTPUT SCHEMA", "")

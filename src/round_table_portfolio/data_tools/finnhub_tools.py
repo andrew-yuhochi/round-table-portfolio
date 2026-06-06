@@ -4,16 +4,12 @@
 #   WORKS:   quote(), company_news(), company_basic_financials(), company_peers()
 #   PREMIUM: stock_candles(), transcripts(), transcripts_list()
 #
-# Price source (updated 2026-06-02 — resolves Yahoo 429 under load):
+# Price source (updated 2026-06-03 — migrated Yahoo → Alpaca, BUG-001/BLG-003):
 #   get_prices():  Served from the LAZY WEEKLY PRICE CACHE (price_cache.py).
-#                  Cache miss → one raw Yahoo v8 fetch per ticker (paced) → cached.
+#                  Cache miss → one Alpaca /v2/stocks/bars fetch per ticker → cached.
 #                  Subsequent calls that week are served from parquet — zero network.
 #                  Final fallback: Finnhub quote() for a live single-bar snapshot.
 #   get_transcript(): Routes entirely to EDGAR 8-K fallback (Finnhub transcripts = premium).
-#
-# Dead paths (yfinance batch, Stooq/pandas-datareader) removed 2026-06-02:
-#   yfinance.download() batch → 429d worse than raw Yahoo under load.
-#   Stooq via pandas-datareader → broken on Python 3.14.
 #
 # TDD Component 2, DATA-SOURCES.md §Finnhub.
 
@@ -67,12 +63,13 @@ def get_prices(
 ) -> FinnhubCandle:
     """Fetch daily OHLCV candles for *ticker* from the lazy weekly price cache.
 
-    Primary path: lazy weekly cache (price_cache.py).  On cache miss, ONE raw
-    Yahoo v8 fetch is made for *ticker* (paced), then cached to parquet.  All
-    subsequent calls for that ticker that week read from the parquet — no network.
+    Primary path: lazy weekly cache (price_cache.py).  On cache miss, ONE Alpaca
+    /v2/stocks/bars fetch is made for *ticker* (split-adjusted), then cached to
+    parquet.  All subsequent calls for that ticker that week read from the
+    parquet — no network.
 
     Final fallback: Finnhub quote() for a live single-bar spot price when the
-    raw Yahoo fetch also fails.
+    Alpaca fetch also fails.
 
     Args:
         ticker:      Uppercase ticker symbol.
@@ -81,7 +78,7 @@ def get_prices(
         all_tickers: Accepted for API compatibility; not used in the lazy path.
 
     Returns:
-        FinnhubCandle with source='raw_yahoo' or 'finnhub_quote'.
+        FinnhubCandle with source='alpaca' or 'finnhub_quote'.
 
     Raises:
         RuntimeError: All sources failed.
@@ -155,9 +152,10 @@ def get_prices(
             }], index=pd.Index([date_str], name="date"))
             quote_df.attrs["source"] = "finnhub_quote"
 
-            # Write to cache so repeat calls this week are parquet-served (0 network).
-            from round_table_portfolio.data_tools.price_cache import _save_ticker_cache
-            _save_ticker_cache(week_id, ticker, quote_df)
+            # NOT written to the history cache — a single-bar spot quote must not
+            # poison the per-ticker parquet that later callers expect to hold full
+            # multi-bar Alpaca history (needed for SMA-200, MACD, etc.).
+            # A later get_cached_prices call will see a cache miss and re-attempt Alpaca.
 
             candle = FinnhubCandle(
                 symbol=ticker,
@@ -170,7 +168,7 @@ def get_prices(
                 s="ok",
                 source="finnhub_quote",
             )
-            logger.info("Finnhub quote() fallback succeeded for %s — result cached", ticker)
+            logger.info("Finnhub quote() fallback succeeded for %s (not cached — spot only)", ticker)
             return candle
         raise RuntimeError(f"Finnhub quote() returned no data for {ticker}: {q}")
 

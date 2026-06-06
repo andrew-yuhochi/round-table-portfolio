@@ -10,7 +10,8 @@
 #   EDGAR:   10 req/sec  (enforced internally by edgartools; we still sleep)
 #   FRED:    generous (no documented limit; we impose 2/sec as courtesy)
 #   RSS:     no limit
-#   yfinance: self-imposed (1/sec to avoid 429)
+#   Alpaca:  200 req/min (free data plan); lazy per-ticker cache means we
+#            rarely approach this — limiter is a safety net only
 #
 # Implementation: token-bucket via a simple per-source deque of timestamps.
 # stdlib-only — no extra dependency.
@@ -122,9 +123,9 @@ FRED_LIMITER = _SourceLimiter(
     calls_per_second=2,   # courtesy cap; FRED has no documented hard limit
 )
 
-YFINANCE_LIMITER = _SourceLimiter(
-    name="yfinance",
-    calls_per_second=1,   # self-imposed to avoid Yahoo 429s
+ALPACA_LIMITER = _SourceLimiter(
+    name="Alpaca",
+    calls_per_minute=200,  # free data plan hard cap; lazy cache means rarely hit
 )
 
 # RSS has no rate limit — no limiter needed
@@ -139,6 +140,6 @@ def get_limiter(source: str) -> _SourceLimiter | None:
         "finnhub": FINNHUB_LIMITER,
         "edgar": EDGAR_LIMITER,
         "fred": FRED_LIMITER,
-        "yfinance": YFINANCE_LIMITER,
+        "alpaca": ALPACA_LIMITER,
     }
     return mapping.get(source.lower())

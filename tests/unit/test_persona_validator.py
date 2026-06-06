@@ -11,6 +11,8 @@ Covers:
     4. missing counterfactual_portfolio in ROUND 1 schema
     5. thin-mandate (one-line MANDATE)
     6. no-ignore-clause in RESEARCH MANDATE
+    7. missing explicit `"CASH"` entry in ROUND 1 counterfactual_portfolio
+       (Layer 1 of the three-layer fully-invested rule — TASK-M2-001)
 """
 
 from __future__ import annotations
@@ -91,7 +93,7 @@ _ROUND1_SCHEMA = (
     '  "round": 1,\n'
     '  "stances": [{"ticker": "<T>", "action": "HOLD", "target_weight": 0.0, '
     '"confidence": 3, "rationale": "<...>"}],\n'
-    '  "counterfactual_portfolio": {"<ticker>": 0.0},\n'
+    '  "counterfactual_portfolio": {"<ticker>": 0.0, "CASH": 0.0},\n'
     '  "narrative_summary": "<thesis>"\n'
     "}\n"
     "```"
@@ -208,12 +210,52 @@ def test_fixture_missing_counterfactual_fails(tmp_path: Path) -> None:
     """Fixture 4 — ROUND 1 schema omits counterfactual_portfolio."""
     secs = dict(_BODY_SECTIONS)
     secs["ROUND 1 OUTPUT SCHEMA"] = _ROUND1_SCHEMA.replace(
-        '  "counterfactual_portfolio": {"<ticker>": 0.0},\n', ""
+        '  "counterfactual_portfolio": {"<ticker>": 0.0, "CASH": 0.0},\n', ""
     )
     p = _write(tmp_path, _build_persona(sections=secs))
     result = validate_persona_definition(p)
     assert not result.ok
     assert any("counterfactual_portfolio" in v for v in result.violations)
+
+
+def test_fixture_missing_cash_clause_fails(tmp_path: Path) -> None:
+    """Fixture 7 (TASK-M2-001) — ROUND 1 schema has counterfactual_portfolio but
+    omits the explicit `"CASH"` entry (Layer 1 of the three-layer fully-invested
+    rule). The validator must FLAG this while still recognizing the
+    counterfactual_portfolio is present.
+    """
+    secs = dict(_BODY_SECTIONS)
+    secs["ROUND 1 OUTPUT SCHEMA"] = _ROUND1_SCHEMA.replace(
+        '  "counterfactual_portfolio": {"<ticker>": 0.0, "CASH": 0.0},\n',
+        '  "counterfactual_portfolio": {"<ticker>": 0.0},\n',
+    )
+    p = _write(tmp_path, _build_persona(sections=secs))
+    result = validate_persona_definition(p)
+    assert not result.ok
+    assert any("CASH" in v for v in result.violations)
+    # The counterfactual_portfolio key IS present — only the CASH entry is missing,
+    # so the counterfactual-missing violation must NOT fire (clean isolation).
+    assert not any(
+        "omits `counterfactual_portfolio`" in v for v in result.violations
+    )
+
+
+def test_all_seven_shipped_personas_pass() -> None:
+    """All 7 authored persona files carry the explicit-CASH ROUND 1 clause and
+    pass the extended validator (TASK-M2-001).
+    """
+    slugs = (
+        "value",
+        "growth",
+        "discretionary-macro",
+        "cta-systematic-macro",
+        "technical",
+        "quant-systematic",
+        "risk-officer",
+    )
+    for slug in slugs:
+        result = validate_persona_definition(AGENTS_DIR / f"{slug}.md")
+        assert result.ok, f"{slug}.md must pass; violations: {result.violations}"
 
 
 def test_fixture_thin_mandate_fails(tmp_path: Path) -> None:
@@ -262,6 +304,7 @@ def test_fixtures_written_to_disk() -> None:
         "fail_missing_section.md",
         "fail_short_in_actions.md",
         "fail_websearch_absent.md",
+        "fail_missing_cash_clause.md",
     }
     present = {p.name for p in fdir.glob("*.md")}
     assert expected.issubset(present), f"Missing on-disk fixtures: {expected - present}"

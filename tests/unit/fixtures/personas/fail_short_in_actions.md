@@ -60,7 +60,7 @@ Read `state/memory/value.md` before forming this week's stance and reference pas
 {
   "round": 1,
   "stances": [{"ticker": "<T>", "action": "HOLD", "target_weight": 0.0, "confidence": 3, "rationale": "<...>"}],
-  "counterfactual_portfolio": {"<ticker>": 0.0},
+  "counterfactual_portfolio": {"<ticker>": 0.0, "CASH": 0.0},
   "narrative_summary": "<thesis>"
 }
 ```

@@ -1,31 +1,36 @@
-# price_cache.py — Lazy weekly price cache.
+# price_cache.py — Lazy weekly price cache backed by Alpaca Markets.
 #
 # Design: LAZY — the first request for a ticker in a given ISO week triggers
-# ONE raw Yahoo v8 fetch for that ticker, then caches the result to
+# ONE Alpaca /v2/stocks/bars fetch for that ticker, then caches the result to
 # state/cache/prices/<week_id>/<ticker>.parquet.  Every subsequent request for
 # that ticker that week (from any persona) is served from the parquet file —
 # zero network calls.
 #
-# Cold-path pacing: a 1 s sleep between successive cold fetches keeps the
-# cold path itself under Yahoo's per-IP rate limit.  The pacing is applied
-# ONLY on cache misses (warm reads have no sleep).
+# Source: Alpaca Markets data API (authenticated, SIP consolidated tape).
+#   Endpoint: GET https://data.alpaca.markets/v2/stocks/bars
+#   Auth:     APCA-API-KEY-ID / APCA-API-SECRET-KEY headers
+#   Params:   symbols, timeframe=1Day, start (2y back), adjustment=split
+#   Batching: multi-symbol supported but called per-ticker here to match the
+#             lazy cache key structure (one parquet per ticker per week).
+#   Pagination: next_page_token followed automatically.
 #
-# 429 retry: _fetch_raw_yahoo retries with exponential backoff (2 retries,
-# base delay 4 s) before returning None so the Finnhub fallback kicks in only
-# on a genuine hard failure — not on a transient rate-limit blip.
+# Adjustment choice: `adjustment=split` — corrects for stock splits so
+# technical indicators (RSI, MACD, SMA-200) don't see false price jumps,
+# without also adjusting for dividends (which would distort absolute price
+# levels used by value personas).
+#
+# 429 handling: Alpaca returns 429 + Retry-After when you exceed 200/min.
+# With authenticated requests and per-ticker lazy caching, you won't normally
+# hit this; the retry honors it when it does occur.
 #
 # Cache key: ISO week (e.g. "2026-W23") + ticker.
 # Cache location: state/cache/prices/<week_id>/<ticker>.parquet
 #
 # Fallback: Finnhub quote() remains in finnhub_tools.get_prices() as the final
-# live-spot fallback (single bar).  price_cache.py only handles the raw-Yahoo
-# path — it does NOT call Finnhub.
+# live-spot fallback (single bar).  price_cache.py only handles the Alpaca path.
 #
-# Dead paths removed (per founder direction 2026-06-02):
-#   - yfinance.download() batch (got 429d worse than raw)
-#   - Stooq via pandas-datareader (broken on Python 3.14)
-#
-# Per TDD Component 2 / research-analyst-confirmed fix 2026-06-02.
+# Migrated from Yahoo Finance v8 → Alpaca Markets 2026-06-03 (BUG-001/BLG-003).
+# Yahoo's unofficial endpoint was IP-banned under bulk authenticated use.
 
 from __future__ import annotations
 
@@ -36,7 +41,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-import certifi
 import pandas as pd
 import requests
 
@@ -45,24 +49,41 @@ logger = logging.getLogger(__name__)
 _STATE_DIR = Path(os.environ.get("STATE_DIR", "state"))
 _CACHE_DIR = _STATE_DIR / "cache" / "prices"
 
-# Seconds to sleep between cold per-ticker fetches — keeps cold path under Yahoo limit.
-_COLD_FETCH_PACE_SECS: float = 1.0
+# No cold-fetch pacing needed: Alpaca is authenticated (200 req/min quota).
+# The module constant is kept so the test fixture that zeroes it still compiles.
+_COLD_FETCH_PACE_SECS: float = 0.0
 
-# Yahoo Finance v8 chart endpoint — range=2y&interval=1d confirmed working 2026-06-02:
-# 251 bars/call, 10 rapid requests, zero 429s (research-analyst live test).
-_YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-_YAHOO_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-}
+# Alpaca Markets data API
+_ALPACA_BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 
-# 429 retry config: two retries with exponential backoff (4 s, 8 s).
-_YAHOO_429_MAX_RETRIES: int = 2
-_YAHOO_429_BASE_DELAY_SECS: float = 4.0
+# 429 retry: honor Retry-After header; fall back to exponential backoff.
+_ALPACA_429_MAX_RETRIES: int = 3
+_ALPACA_429_BASE_DELAY_SECS: float = 2.0
+
+# Look-back: ~2 years of daily bars (Alpaca free tier supports this)
+_ALPACA_LOOKBACK_DAYS: int = 730
+
+# Canonical fetch depth: every cold fetch stores at least this many calendar
+# days of history so that SMA-200 (needs ≥200 trading days ≈ 280 calendar days)
+# and other long-lookback indicators are always available in the cache.
+# Short "days" requests are SLICED from this canonical entry — they never cap it.
+_CANONICAL_DAYS: int = 365
+
+
+def _alpaca_auth_headers() -> dict[str, str]:
+    """Build Alpaca auth headers from environment. Raises if keys are missing."""
+    key_id = os.environ.get("ALPACA_API_KEY_ID")
+    secret = os.environ.get("ALPACA_API_SECRET_KEY")
+    if not key_id or not secret:
+        raise EnvironmentError(
+            "ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY must be set. "
+            "Add them to .env (see .env.example)."
+        )
+    return {
+        "APCA-API-KEY-ID": key_id,
+        "APCA-API-SECRET-KEY": secret,
+        "Accept": "application/json",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -96,107 +117,140 @@ def _save_ticker_cache(week_id: str, ticker: str, df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Raw Yahoo v8 fetch (the one path that actually works — confirmed 200)
+# Alpaca fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_raw_yahoo(ticker: str, days: int) -> Optional[pd.DataFrame]:
-    """Fetch OHLCV for *ticker* from the Yahoo Finance v8 chart endpoint.
+def _fetch_alpaca(ticker: str, days: int) -> Optional[pd.DataFrame]:
+    """Fetch OHLCV for *ticker* from the Alpaca Markets /v2/stocks/bars endpoint.
 
-    Uses range=2y&interval=1d — confirmed to return ~504 daily bars with zero
-    429s at research-analyst live-test pace (2026-06-02).  The *days* parameter
-    is accepted for API compatibility but the range param drives lookback.
-
-    Retries up to _YAHOO_429_MAX_RETRIES times on HTTP 429 with exponential
-    backoff before returning None (which triggers the Finnhub quote() fallback).
+    Uses the SIP consolidated tape (default feed), 1Day timeframe, split
+    adjustment, ~2-year lookback.  Follows pagination via next_page_token.
 
     Returns a DataFrame indexed by date (str "YYYY-MM-DD") with columns
     open/high/low/close/volume, or None on any hard failure.
     """
-    url = _YAHOO_CHART_URL.format(ticker=ticker)
-    params = {"range": "2y", "interval": "1d"}
+    try:
+        headers = _alpaca_auth_headers()
+    except EnvironmentError as exc:
+        logger.error("price_cache: Alpaca auth missing — %s", exc)
+        return None
 
+    start_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    params: dict = {
+        "symbols": ticker,
+        "timeframe": "1Day",
+        "start": start_date,
+        "adjustment": "split",
+        "limit": 1000,
+    }
+
+    rows: list[dict] = []
     attempt = 0
+
     while True:
         try:
             resp = requests.get(
-                url,
+                _ALPACA_BARS_URL,
                 params=params,
-                headers=_YAHOO_HEADERS,
-                verify=certifi.where(),
-                timeout=15,
+                headers=headers,
+                timeout=20,
             )
-            if resp.status_code == 429:
-                if attempt < _YAHOO_429_MAX_RETRIES:
-                    delay = _YAHOO_429_BASE_DELAY_SECS * (2 ** attempt)
-                    logger.warning(
-                        "price_cache: Yahoo 429 for %s — retry %d/%d in %.0fs",
-                        ticker, attempt + 1, _YAHOO_429_MAX_RETRIES, delay,
+        except requests.RequestException as exc:
+            logger.warning("price_cache: Alpaca network error for %s: %s", ticker, exc)
+            return None
+
+        if resp.status_code == 429:
+            if attempt < _ALPACA_429_MAX_RETRIES:
+                retry_after_hdr = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after_hdr) if retry_after_hdr else (
+                        _ALPACA_429_BASE_DELAY_SECS * (2 ** attempt)
                     )
-                    time.sleep(delay)
-                    attempt += 1
-                    continue
+                except ValueError:
+                    delay = _ALPACA_429_BASE_DELAY_SECS * (2 ** attempt)
                 logger.warning(
-                    "price_cache: Yahoo 429 for %s — exhausted %d retries, giving up",
-                    ticker, _YAHOO_429_MAX_RETRIES,
+                    "price_cache: Alpaca 429 for %s — retry %d/%d in %.0fs",
+                    ticker, attempt + 1, _ALPACA_429_MAX_RETRIES, delay,
                 )
-                return None
+                time.sleep(delay)
+                attempt += 1
+                continue
+            logger.warning(
+                "price_cache: Alpaca 429 for %s — exhausted %d retries, giving up",
+                ticker, _ALPACA_429_MAX_RETRIES,
+            )
+            return None
+
+        try:
             resp.raise_for_status()
         except requests.HTTPError as exc:
-            logger.warning("price_cache: Yahoo HTTP error for %s: %s", ticker, exc)
-            return None
-        except requests.RequestException as exc:
-            logger.warning("price_cache: Yahoo network error for %s: %s", ticker, exc)
-            return None
-        break  # successful response — exit retry loop
-
-    try:
-        payload = resp.json()
-        result = payload["chart"]["result"]
-        if not result:
-            logger.warning("price_cache: Yahoo returned empty result for %s", ticker)
+            logger.warning("price_cache: Alpaca HTTP error for %s: %s", ticker, exc)
             return None
 
-        chart = result[0]
-        timestamps = chart.get("timestamp", [])
-        indicators = chart.get("indicators", {})
-        quote = indicators.get("quote", [{}])[0]
-        adjclose_list = indicators.get("adjclose", [{}])
-        adjclose = adjclose_list[0].get("adjclose", []) if adjclose_list else []
-
-        if not timestamps:
-            logger.warning("price_cache: Yahoo: no timestamps for %s", ticker)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.warning("price_cache: Alpaca JSON parse error for %s: %s", ticker, exc)
             return None
 
-        rows: list[dict] = []
-        closes_raw = quote.get("close", [])
-        # Prefer adjclose when available
-        close_src = adjclose if len(adjclose) == len(timestamps) else closes_raw
-
-        for i, ts in enumerate(timestamps):
-            close_val = _safe_float(_nth(close_src, i))
-            if close_val is None:
-                continue
+        bars_by_symbol = payload.get("bars") or {}
+        ticker_bars = bars_by_symbol.get(ticker, [])
+        for bar in ticker_bars:
+            date_str = bar["t"][:10]  # "2024-01-02T00:00:00Z" → "2024-01-02"
             rows.append({
-                "date": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d"),
-                "open":   _safe_float(_nth(quote.get("open", []), i)),
-                "high":   _safe_float(_nth(quote.get("high", []), i)),
-                "low":    _safe_float(_nth(quote.get("low", []), i)),
-                "close":  close_val,
-                "volume": _safe_float(_nth(quote.get("volume", []), i)),
+                "date":   date_str,
+                "open":   _safe_float(bar.get("o")),
+                "high":   _safe_float(bar.get("h")),
+                "low":    _safe_float(bar.get("l")),
+                "close":  _safe_float(bar.get("c")),
+                "volume": _safe_float(bar.get("v")),
             })
 
-        if not rows:
-            logger.warning("price_cache: Yahoo: 0 valid rows for %s", ticker)
-            return None
+        next_token = payload.get("next_page_token")
+        if not next_token:
+            break  # all pages consumed
 
-        df = pd.DataFrame(rows).set_index("date")
-        df.attrs["source"] = "raw_yahoo"
-        logger.info("price_cache: Yahoo OK — %s: %d rows", ticker, len(df))
-        return df
+        # Pass the page token on the next request
+        params["page_token"] = next_token
+        attempt = 0  # reset retry counter for the next page
 
-    except (KeyError, IndexError, ValueError, TypeError) as exc:
-        logger.warning("price_cache: Yahoo parse error for %s: %s", ticker, exc)
+    if not rows:
+        logger.warning("price_cache: Alpaca: 0 bars returned for %s", ticker)
         return None
+
+    df = pd.DataFrame(rows).set_index("date")
+    df.attrs["source"] = "alpaca"
+    logger.info("price_cache: Alpaca OK — %s: %d rows", ticker, len(df))
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _slice_to_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    """Return the most-recent *days* calendar days from *df* (tail slice).
+
+    The index is expected to be date strings "YYYY-MM-DD" in ascending order.
+    We include all rows whose date falls within *days* calendar days before the
+    last row's date.  If the DataFrame is already shorter than *days*, it is
+    returned as-is (no padding).
+
+    df.attrs are preserved on the returned slice.
+    """
+    if df.empty or days <= 0:
+        return df
+    try:
+        from datetime import datetime, timedelta
+        last_date = datetime.strptime(str(df.index[-1]), "%Y-%m-%d")
+        cutoff = (last_date - timedelta(days=days)).strftime("%Y-%m-%d")
+        sliced = df[df.index >= cutoff]
+    except Exception:
+        # Index format unexpected — return full frame; indicator will see all bars
+        sliced = df
+    # Preserve attrs (source tag etc.)
+    sliced.attrs = df.attrs
+    return sliced
 
 
 # ---------------------------------------------------------------------------
@@ -213,57 +267,60 @@ def get_cached_prices(
 ) -> Optional[pd.DataFrame]:
     """Return a per-ticker OHLCV DataFrame from the lazy weekly cache.
 
-    On cache miss: fetches *ticker* via one raw Yahoo v8 request, writes the
-    parquet, and returns the result.  A short sleep (_COLD_FETCH_PACE_SECS) is
-    applied before each cold fetch to stay under Yahoo's rate limit.
+    Cache always stores the canonical depth (_CANONICAL_DAYS, or the requested
+    window if larger) so that long-lookback indicators (SMA-200) are always
+    available.  A short-window request is sliced from the canonical entry —
+    it never causes the cache to store fewer bars than a later long request needs.
 
-    On cache hit: returns the cached parquet immediately — no network call.
+    On cache miss: fetches *ticker* at max(days, _CANONICAL_DAYS) calendar days,
+    writes the full canonical parquet, then slices the return value to *days*.
+
+    On cache hit: reads the full canonical parquet and slices to *days*.
+
+    The Finnhub-quote single-bar fallback is NOT stored in this cache; callers
+    in finnhub_tools return it directly to avoid poisoning history reads.
 
     Args:
         ticker:      Ticker to retrieve.
         week_id:     ISO week key (e.g. "2026-W23") — determines cache freshness.
-        days:        Look-back window in calendar days (used on cold fetch only).
+        days:        Requested look-back window in calendar days.  The cache may
+                     hold MORE bars (up to _CANONICAL_DAYS); the caller gets at
+                     most *days* worth sliced from the tail.
         all_tickers: Accepted for API compatibility with old callers; not used.
-                     The lazy design fetches each ticker individually on first miss.
-        _pace:       If True (default), sleep before cold fetch.  Set False in tests.
+        _pace:       Accepted for API compatibility; Alpaca needs no pacing.
 
     Returns:
         DataFrame indexed by date (str) with columns open/high/low/close/volume,
-        or None if Yahoo fetch fails.
+        sliced to at most *days* calendar days from the tail of the canonical
+        series, or None if the Alpaca fetch fails.
     """
     ticker = ticker.upper().strip()
 
     # --- Cache hit path ---
     cached = _load_ticker_cache(week_id, ticker)
     if cached is not None:
-        return cached
+        return _slice_to_days(cached, days)
 
-    # --- Cache miss: one raw Yahoo fetch for this ticker ---
-    logger.info("price_cache: miss  %s/%s — raw Yahoo fetch", week_id, ticker)
+    # --- Cache miss: fetch at canonical depth to future-proof long-lookback callers ---
+    fetch_days = max(days, _CANONICAL_DAYS)
+    logger.info(
+        "price_cache: miss  %s/%s — Alpaca fetch (fetch_days=%d, requested=%d)",
+        week_id, ticker, fetch_days, days,
+    )
 
-    if _pace:
-        time.sleep(_COLD_FETCH_PACE_SECS)
-
-    df = _fetch_raw_yahoo(ticker, days)
+    df = _fetch_alpaca(ticker, fetch_days)
     if df is None:
-        logger.error("price_cache: raw Yahoo failed for %s/%s", week_id, ticker)
+        logger.error("price_cache: Alpaca failed for %s/%s", week_id, ticker)
         return None
 
+    # Store the full canonical fetch; slice for this caller.
     _save_ticker_cache(week_id, ticker, df)
-    return df
+    return _slice_to_days(df, days)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _nth(lst: list, i: int):
-    """Return lst[i] or None if out of range."""
-    try:
-        return lst[i]
-    except (IndexError, TypeError):
-        return None
-
 
 def _safe_float(val: object) -> Optional[float]:
     if val is None:

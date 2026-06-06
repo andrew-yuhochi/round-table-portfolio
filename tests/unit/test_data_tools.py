@@ -224,7 +224,7 @@ class TestRateLimiter:
         assert get_limiter("finnhub") is not None
         assert get_limiter("edgar") is not None
         assert get_limiter("fred") is not None
-        assert get_limiter("yfinance") is not None
+        assert get_limiter("alpaca") is not None
         assert get_limiter("rss") is None   # RSS has no rate limit
 
     def test_per_second_bucket_fills_and_triggers_sleep(self) -> None:
@@ -266,7 +266,7 @@ class TestRateLimiter:
 # get_prices — mocked (cache-based implementation)
 # ---------------------------------------------------------------------------
 
-def _make_ticker_df(n_bars: int = 5, source: str = "raw_yahoo") -> "pd.DataFrame":
+def _make_ticker_df(n_bars: int = 5, source: str = "alpaca") -> "pd.DataFrame":
     """Build a fake per-ticker OHLCV DataFrame indexed by date (str).
 
     Matches the format written by price_cache._save_ticker_cache().
@@ -302,7 +302,7 @@ class TestGetPrices:
         ticker_df.to_parquet(cache_path)
 
         # Any network call would fail → proves cache is served
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=AssertionError("Should not fetch on cache hit")):
             import round_table_portfolio.data_tools.finnhub_tools as ft
             result = ft.get_prices("AAPL", week_id=week_id)
@@ -310,12 +310,12 @@ class TestGetPrices:
         assert result.symbol == "AAPL"
         assert result.s == "ok"
         assert len(result.c) == 3
-        assert result.source == "raw_yahoo"
+        assert result.source == "alpaca"
 
-    def test_cache_miss_triggers_one_raw_yahoo_fetch(
+    def test_cache_miss_triggers_one_alpaca_fetch(
         self, tmp_state: Path
     ) -> None:
-        """Cache miss: exactly one raw Yahoo fetch per ticker."""
+        """Cache miss: exactly one Alpaca fetch per ticker."""
         import round_table_portfolio.data_tools.price_cache as pcmod
 
         fetch_call_count = {"n": 0}
@@ -324,12 +324,12 @@ class TestGetPrices:
             fetch_call_count["n"] += 1
             return _make_ticker_df(n_bars=5)
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=fake_fetch):
             import round_table_portfolio.data_tools.finnhub_tools as ft
             result = ft.get_prices("AAPL", week_id="2026-W99")
 
-        # One raw fetch for this ticker
+        # One Alpaca fetch for this ticker
         assert fetch_call_count["n"] == 1
         assert result.symbol == "AAPL"
         assert result.s == "ok"
@@ -338,20 +338,21 @@ class TestGetPrices:
         cache_path = pcmod._CACHE_DIR / "2026-W99" / "AAPL.parquet"
         assert cache_path.exists()
 
-    def test_raw_yahoo_failure_triggers_finnhub_quote_fallback(
+    def test_alpaca_failure_triggers_finnhub_quote_fallback(
         self, tmp_state: Path, mock_finnhub_client: MagicMock
     ) -> None:
-        """When raw Yahoo fetch fails, Finnhub quote() is the fallback.
+        """When Alpaca fetch fails, Finnhub quote() is the fallback.
 
-        Crucially, the quote result is written to the parquet cache so that
-        repeat calls this week are served from disk — not from Finnhub again.
+        The single-bar quote result must NOT be written to the history cache —
+        doing so would poison later callers that need multi-bar Alpaca history
+        (BUG-002 fallback-poison failure mode).
         """
         import round_table_portfolio.data_tools.price_cache as pcmod
 
         mock_finnhub_client.quote.return_value = {
             "c": 150.0, "h": 152.0, "l": 149.0, "o": 151.0, "t": 1700000000
         }
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    return_value=None), \
              patch("round_table_portfolio.data_tools.finnhub_tools._get_client",
                    return_value=mock_finnhub_client), \
@@ -363,16 +364,17 @@ class TestGetPrices:
         assert result.s == "ok"
         assert result.c == [150.0]
 
-        # Parquet must be written so the next call is cache-served (not Finnhub again)
-        assert (pcmod._CACHE_DIR / "2026-W97" / "AAPL.parquet").exists(), (
-            "Finnhub quote fallback must write parquet so repeat calls are cache-served"
+        # Must NOT be in the history cache — a 1-bar spot quote must not be served
+        # as if it were full Alpaca history to a later caller requesting ≥200 bars.
+        assert not (pcmod._CACHE_DIR / "2026-W97" / "AAPL.parquet").exists(), (
+            "Finnhub quote fallback must NOT write to history cache (BUG-002 fallback-poison)"
         )
 
     def test_all_sources_fail_raises_runtime_error(
         self, mock_finnhub_client: MagicMock
     ) -> None:
         mock_finnhub_client.quote.side_effect = Exception("Finnhub down")
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    return_value=None), \
              patch("round_table_portfolio.data_tools.finnhub_tools._get_client",
                    return_value=mock_finnhub_client), \
@@ -401,7 +403,7 @@ class TestPriceCache:
             fetch_calls["n"] += 1
             return _make_ticker_df()
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=fake_fetch):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             result = get_cached_prices("AAPL", week_id=week_id)
@@ -410,8 +412,8 @@ class TestPriceCache:
         assert result is not None
         assert len(result) == 5
 
-    def test_cache_miss_triggers_one_raw_yahoo_fetch(self, tmp_state: Path) -> None:
-        """Cache miss → exactly one call to _fetch_raw_yahoo for that ticker."""
+    def test_cache_miss_triggers_one_alpaca_fetch(self, tmp_state: Path) -> None:
+        """Cache miss → exactly one call to _fetch_alpaca for that ticker."""
         fetch_calls = {"n": 0, "ticker_arg": None}
 
         def fake_fetch(ticker, days):
@@ -419,7 +421,7 @@ class TestPriceCache:
             fetch_calls["ticker_arg"] = ticker
             return _make_ticker_df()
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=fake_fetch):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             get_cached_prices("AAPL", week_id="2026-W55")
@@ -437,7 +439,7 @@ class TestPriceCache:
             fetch_calls[ticker] = fetch_calls.get(ticker, 0) + 1
             return _make_ticker_df(n_bars=3)
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=fake_fetch):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             result_aapl = get_cached_prices("AAPL", week_id="2026-W56")
@@ -460,13 +462,13 @@ class TestPriceCache:
             fetch_calls["n"] += 1
             return _make_ticker_df(n_bars=4)
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=fake_fetch):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             get_cached_prices("NVDA", week_id="2026-W57")  # miss → fetch
 
         # Second call — _fetch_raw_yahoo must NOT be called again
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=AssertionError("should not fetch on cache hit")):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             result = get_cached_prices("NVDA", week_id="2026-W57")
@@ -474,9 +476,9 @@ class TestPriceCache:
         assert fetch_calls["n"] == 1
         assert result is not None and len(result) == 4
 
-    def test_raw_yahoo_failure_returns_none(self, tmp_state: Path) -> None:
-        """When _fetch_raw_yahoo returns None, get_cached_prices returns None."""
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+    def test_alpaca_failure_returns_none(self, tmp_state: Path) -> None:
+        """When _fetch_alpaca returns None, get_cached_prices returns None."""
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    return_value=None):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             result = get_cached_prices("AAPL", week_id="2026-W58")
@@ -487,48 +489,38 @@ class TestPriceCache:
         """After a cache miss + successful fetch, the per-ticker parquet file exists."""
         import round_table_portfolio.data_tools.price_cache as pcmod
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    return_value=_make_ticker_df()):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             get_cached_prices("AAPL", week_id="2026-W59")
 
         assert (pcmod._CACHE_DIR / "2026-W59" / "AAPL.parquet").exists()
 
-    def test_pacing_applied_on_cold_fetch(self, tmp_state: Path) -> None:
-        """Cold fetch calls time.sleep exactly once (pacing applied per miss)."""
-        import round_table_portfolio.data_tools.price_cache as pcmod
-
+    def test_no_pacing_sleep_on_cold_fetch(self, tmp_state: Path) -> None:
+        """Alpaca is authenticated — cold fetch must not sleep (no per-IP pacing needed)."""
         sleep_calls: list[float] = []
 
-        def fake_sleep(s: float) -> None:
-            sleep_calls.append(s)
+        with patch("round_table_portfolio.data_tools.price_cache.time.sleep",
+                   side_effect=lambda s: sleep_calls.append(s)), \
+             patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   return_value=_make_ticker_df()):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            get_cached_prices("AAPL", week_id="2026-W60")
 
-        # Override pace to non-zero so we can detect the call
-        pcmod._COLD_FETCH_PACE_SECS = 0.1
-        try:
-            with patch("round_table_portfolio.data_tools.price_cache.time.sleep",
-                       side_effect=fake_sleep), \
-                 patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
-                       return_value=_make_ticker_df()):
-                from round_table_portfolio.data_tools.price_cache import get_cached_prices
-                get_cached_prices("AAPL", week_id="2026-W60")
-        finally:
-            pcmod._COLD_FETCH_PACE_SECS = 0.0  # restore for other tests
+        # No pacing sleep — only 429-backoff sleeps would appear, and there are none here
+        assert sleep_calls == [], f"Expected no pacing sleep, got {sleep_calls}"
 
-        assert len(sleep_calls) == 1
-        assert sleep_calls[0] == 0.1
+    def test_cold_fetch_pace_is_zero_for_alpaca(self) -> None:
+        """Alpaca is authenticated — no per-IP rate-limit pacing needed.
 
-    def test_default_pace_is_one_second(self) -> None:
-        """Module constant confirms 1 s default pacing (not old 0.5 s value)."""
+        The constant exists only for API compatibility with old test fixtures
+        that zero it via monkeypatch.  Its module-level default is 0.0.
+        """
+        import inspect
         import round_table_portfolio.data_tools.price_cache as pcmod
-        # The autouse fixture zeroes this for unit tests — check the original module default.
-        # We re-import the constant's documented value from the source, not the patched attr.
-        assert pcmod._COLD_FETCH_PACE_SECS == 0.0  # fixture has zeroed it — that's fine
-        # The documented default before fixture override is 1.0; verify via module source.
-        import importlib, inspect
         src = inspect.getsource(pcmod)
-        assert "_COLD_FETCH_PACE_SECS: float = 1.0" in src, (
-            "Default pace must be 1.0 s (not old 0.5 s) per the historical-price fix spec"
+        assert "_COLD_FETCH_PACE_SECS: float = 0.0" in src, (
+            "_COLD_FETCH_PACE_SECS must default to 0.0 — Alpaca needs no per-request pacing"
         )
 
     def test_week_rollover_triggers_refetch(self, tmp_state: Path) -> None:
@@ -541,7 +533,7 @@ class TestPriceCache:
             # Identify which week triggered this fetch via the parquet dir
             return _make_ticker_df(n_bars=2)
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=fake_fetch):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
             get_cached_prices("AAPL", week_id="2026-W23")
@@ -553,36 +545,37 @@ class TestPriceCache:
 
 
 # ---------------------------------------------------------------------------
-# Yahoo v8 chart endpoint — range=2y parsing + 429 backoff
+# Alpaca fetch — request correctness + 429 handling
 # ---------------------------------------------------------------------------
 
-def _make_yahoo_chart_payload(ticker: str, n_bars: int = 251) -> dict:
-    """Minimal Yahoo v8/chart JSON payload with *n_bars* daily bars."""
-    import time as _time
-    base_ts = 1700000000
-    timestamps = [base_ts + i * 86400 for i in range(n_bars)]
-    closes = [100.0 + i * 0.1 for i in range(n_bars)]
-    highs  = [c + 1.0 for c in closes]
-    lows   = [c - 1.0 for c in closes]
-    opens  = [c + 0.2 for c in closes]
-    vols   = [1_000_000] * n_bars
-    return {
-        "chart": {
-            "result": [{
-                "timestamp": timestamps,
-                "indicators": {
-                    "quote": [{"open": opens, "high": highs, "low": lows,
-                               "close": closes, "volume": vols}],
-                    "adjclose": [{"adjclose": closes}],
-                },
-            }],
-            "error": None,
-        }
-    }
+def _make_alpaca_bars_payload(ticker: str, n_bars: int = 607,
+                               next_page_token: str | None = None) -> dict:
+    """Minimal Alpaca /v2/stocks/bars JSON response with *n_bars* daily bars."""
+    from datetime import datetime, timedelta, timezone
+    base = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    bars = []
+    for i in range(n_bars):
+        day = (base + timedelta(days=i)).strftime("%Y-%m-%dT00:00:00Z")
+        bars.append({
+            "t": day,
+            "o": 100.0 + i * 0.1,
+            "h": 102.0 + i * 0.1,
+            "l": 99.0 + i * 0.1,
+            "c": 101.0 + i * 0.1,
+            "v": 1_000_000,
+            "n": 5000,
+            "vw": 101.0 + i * 0.1,
+        })
+    payload: dict = {"bars": {ticker: bars}}
+    if next_page_token:
+        payload["next_page_token"] = next_page_token
+    else:
+        payload["next_page_token"] = None
+    return payload
 
 
-class TestYahooChartEndpoint:
-    """Unit tests for the raw Yahoo v8 chart fetch — mocks requests.get."""
+class TestAlpacaFetch:
+    """Unit tests for _fetch_alpaca — mocks requests.get throughout."""
 
     def _mock_response(self, payload: dict, status_code: int = 200) -> MagicMock:
         resp = MagicMock()
@@ -597,98 +590,156 @@ class TestYahooChartEndpoint:
             resp.raise_for_status.return_value = None
         return resp
 
-    def test_chart_payload_parsed_into_250_plus_bars(self) -> None:
-        """range=2y response with 251 bars parses into a ≥250-row DataFrame."""
-        payload = _make_yahoo_chart_payload("AAPL", n_bars=251)
+    def test_alpaca_payload_parsed_into_600_plus_bars(self) -> None:
+        """Response with 607 bars parses into a ≥600-row DataFrame."""
+        payload = _make_alpaca_bars_payload("AAPL", n_bars=607)
         mock_resp = self._mock_response(payload)
         with patch("round_table_portfolio.data_tools.price_cache.requests.get",
-                   return_value=mock_resp):
-            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
-            df = _fetch_raw_yahoo("AAPL", days=730)
+                   return_value=mock_resp), \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}):
+            from round_table_portfolio.data_tools.price_cache import _fetch_alpaca
+            df = _fetch_alpaca("AAPL", days=730)
         assert df is not None
-        assert len(df) >= 250, f"Expected ≥250 bars, got {len(df)}"
+        assert len(df) >= 600, f"Expected ≥600 bars, got {len(df)}"
         assert set(df.columns) >= {"open", "high", "low", "close", "volume"}
-        assert df.attrs.get("source") == "raw_yahoo"
+        assert df.attrs.get("source") == "alpaca"
 
-    def test_range_param_sent_not_period_timestamps(self) -> None:
-        """Confirms the request uses range=2y rather than period1/period2."""
-        payload = _make_yahoo_chart_payload("AAPL", n_bars=10)
+    def test_request_params_correct(self) -> None:
+        """Confirms: symbols=AAPL, timeframe=1Day, adjustment=split, no feed=iex."""
+        payload = _make_alpaca_bars_payload("AAPL", n_bars=5)
         mock_resp = self._mock_response(payload)
         with patch("round_table_portfolio.data_tools.price_cache.requests.get",
-                   return_value=mock_resp) as mock_get:
-            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
-            _fetch_raw_yahoo("AAPL", days=730)
+                   return_value=mock_resp) as mock_get, \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}):
+            from round_table_portfolio.data_tools.price_cache import _fetch_alpaca
+            _fetch_alpaca("AAPL", days=730)
         _, kwargs = mock_get.call_args
         sent_params = kwargs.get("params", {})
-        assert sent_params.get("range") == "2y", (
-            f"Expected range=2y param, got params={sent_params}"
-        )
-        assert sent_params.get("interval") == "1d"
-        assert "period1" not in sent_params, "Old period1/period2 form must not be used"
-        assert "period2" not in sent_params
+        assert sent_params.get("symbols") == "AAPL"
+        assert sent_params.get("timeframe") == "1Day"
+        assert sent_params.get("adjustment") == "split"
+        assert "feed" not in sent_params, "Must NOT pass feed= param (use default SIP tape)"
 
-    def test_429_triggers_exponential_backoff_and_retry(self) -> None:
-        """First call returns 429; second call returns 200 with data — retry succeeds."""
-        import round_table_portfolio.data_tools.price_cache as pcmod
+    def test_auth_headers_present(self) -> None:
+        """Both Alpaca auth headers must be sent on every request."""
+        payload = _make_alpaca_bars_payload("AAPL", n_bars=5)
+        mock_resp = self._mock_response(payload)
+        fake_headers = {"APCA-API-KEY-ID": "test_key_id", "APCA-API-SECRET-KEY": "test_secret"}
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   return_value=mock_resp) as mock_get, \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value=fake_headers):
+            from round_table_portfolio.data_tools.price_cache import _fetch_alpaca
+            _fetch_alpaca("AAPL", days=730)
+        _, kwargs = mock_get.call_args
+        sent_headers = kwargs.get("headers", {})
+        assert "APCA-API-KEY-ID" in sent_headers, "APCA-API-KEY-ID header must be sent"
+        assert "APCA-API-SECRET-KEY" in sent_headers, "APCA-API-SECRET-KEY header must be sent"
 
-        payload = _make_yahoo_chart_payload("AAPL", n_bars=10)
-        resp_429 = self._mock_response({}, status_code=429)
-        resp_200 = self._mock_response(payload, status_code=200)
+    def test_pagination_followed(self) -> None:
+        """When next_page_token is non-null, a second request is made with page_token."""
+        page1 = _make_alpaca_bars_payload("AAPL", n_bars=3, next_page_token="tok123")
+        page2 = _make_alpaca_bars_payload("AAPL", n_bars=2, next_page_token=None)
+        resp1 = self._mock_response(page1)
+        resp2 = self._mock_response(page2)
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   side_effect=[resp1, resp2]) as mock_get, \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}):
+            from round_table_portfolio.data_tools.price_cache import _fetch_alpaca
+            df = _fetch_alpaca("AAPL", days=730)
+        assert mock_get.call_count == 2, "Expected 2 requests (pagination)"
+        assert df is not None
+        assert len(df) == 5, f"Expected 3+2=5 bars total, got {len(df)}"
+        # Second call must carry page_token
+        second_call_params = mock_get.call_args_list[1][1].get("params", {})
+        assert second_call_params.get("page_token") == "tok123"
+
+    def test_429_triggers_retry_with_retry_after(self) -> None:
+        """First call returns 429 with Retry-After; second call returns 200 — retry succeeds."""
+        payload = _make_alpaca_bars_payload("AAPL", n_bars=10)
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "5"}
+        resp_200 = self._mock_response(payload)
 
         sleep_calls: list[float] = []
-
-        def fake_sleep(s: float) -> None:
-            sleep_calls.append(s)
-
         with patch("round_table_portfolio.data_tools.price_cache.requests.get",
                    side_effect=[resp_429, resp_200]), \
              patch("round_table_portfolio.data_tools.price_cache.time.sleep",
-                   side_effect=fake_sleep):
-            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
-            df = _fetch_raw_yahoo("AAPL", days=730)
+                   side_effect=lambda s: sleep_calls.append(s)), \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}):
+            from round_table_portfolio.data_tools.price_cache import _fetch_alpaca
+            df = _fetch_alpaca("AAPL", days=730)
 
-        assert df is not None, "Should succeed after retry"
-        assert len(df) == 10
-        # One backoff sleep was triggered (base delay × 2^0 = 4s or patched equivalent)
-        assert len(sleep_calls) >= 1, "Expected at least one backoff sleep on 429"
+        assert df is not None and len(df) == 10, "Should succeed after 429 retry"
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == 5.0, f"Expected Retry-After 5.0s, got {sleep_calls[0]}s"
 
     def test_429_exhausted_returns_none(self) -> None:
-        """When all retries are exhausted by 429s, _fetch_raw_yahoo returns None."""
+        """When all retries are exhausted by 429s, _fetch_alpaca returns None."""
         import round_table_portfolio.data_tools.price_cache as pcmod
-
-        # More 429s than retries
-        resp_429 = self._mock_response({}, status_code=429)
-        n_attempts = pcmod._YAHOO_429_MAX_RETRIES + 1
-
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
         with patch("round_table_portfolio.data_tools.price_cache.requests.get",
                    return_value=resp_429), \
-             patch("round_table_portfolio.data_tools.price_cache.time.sleep"):
-            from round_table_portfolio.data_tools.price_cache import _fetch_raw_yahoo
-            df = _fetch_raw_yahoo("AAPL", days=730)
-
+             patch("round_table_portfolio.data_tools.price_cache.time.sleep"), \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}):
+            from round_table_portfolio.data_tools.price_cache import _fetch_alpaca
+            df = _fetch_alpaca("AAPL", days=730)
         assert df is None, "Should return None after retries exhausted"
 
-    def test_cache_hit_serves_without_network_after_chart_fetch(
-        self, tmp_state: Path
-    ) -> None:
-        """After a cold chart fetch writes parquet, re-request serves from cache."""
+    def test_empty_bars_returns_none(self) -> None:
+        """When Alpaca returns bars={} for the ticker, _fetch_alpaca returns None."""
+        payload = {"bars": {}, "next_page_token": None}
+        mock_resp = self._mock_response(payload)
+        with patch("round_table_portfolio.data_tools.price_cache.requests.get",
+                   return_value=mock_resp), \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}):
+            from round_table_portfolio.data_tools.price_cache import _fetch_alpaca
+            df = _fetch_alpaca("AAPL", days=730)
+        assert df is None
+
+    def test_cache_hit_serves_after_alpaca_cold_fetch(self, tmp_state: Path) -> None:
+        """After a cold Alpaca fetch writes parquet, re-request serves from cache.
+
+        The 607-bar Alpaca payload spans ~2 years; get_cached_prices with the
+        default days=365 slices to the most-recent 365 calendar days — so the
+        returned frame is ~365 rows, not all 607.  The cache file itself holds
+        all 607 bars (the canonical full fetch).
+        """
         import round_table_portfolio.data_tools.price_cache as pcmod
 
-        payload = _make_yahoo_chart_payload("AAPL", n_bars=251)
+        payload = _make_alpaca_bars_payload("AAPL", n_bars=607)
         mock_resp = self._mock_response(payload)
 
         with patch("round_table_portfolio.data_tools.price_cache.requests.get",
-                   return_value=mock_resp):
+                   return_value=mock_resp), \
+             patch("round_table_portfolio.data_tools.price_cache._alpaca_auth_headers",
+                   return_value={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
-            result1 = get_cached_prices("AAPL", week_id="2026-W70", _pace=False)
+            result1 = get_cached_prices("AAPL", week_id="2026-W70")
 
-        assert result1 is not None and len(result1) >= 250
+        # With days=365 (default), _slice_to_days trims to the last 365 calendar days
+        assert result1 is not None and len(result1) >= 200
 
-        # Second request: requests.get must NOT be called (cache serves it)
+        # The parquet on disk holds the full canonical fetch (all 607 bars)
+        cache_path = pcmod._CACHE_DIR / "2026-W70" / "AAPL.parquet"
+        assert cache_path.exists()
+        cached_on_disk = pcmod._load_ticker_cache("2026-W70", "AAPL")
+        assert cached_on_disk is not None and len(cached_on_disk) >= 600
+
+        # Second request: requests.get must NOT be called
         with patch("round_table_portfolio.data_tools.price_cache.requests.get",
                    side_effect=AssertionError("cache not serving — live fetch fired")):
             from round_table_portfolio.data_tools.price_cache import get_cached_prices
-            result2 = get_cached_prices("AAPL", week_id="2026-W70", _pace=False)
+            result2 = get_cached_prices("AAPL", week_id="2026-W70")
 
         assert result2 is not None
         assert len(result2) == len(result1)
@@ -747,13 +798,13 @@ class TestPriceCacheLoadProof:
             return _make_ticker_df(n_bars=30)
 
         # --- Step 1: Cold-start — 4 tickers, each fetched exactly once ---
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=fake_raw_yahoo):
             for ticker in self.TICKERS:
                 result = get_prices(ticker, week_id=week_id, days=30)
                 assert result.s == "ok", f"Cold fetch failed for {ticker}"
-                assert result.source == "raw_yahoo", (
-                    f"{ticker}: expected raw_yahoo on cold fetch, got {result.source!r}"
+                assert result.source == "alpaca", (
+                    f"{ticker}: expected alpaca on cold fetch, got {result.source!r}"
                 )
                 assert (pcmod._CACHE_DIR / week_id / f"{ticker}.parquet").exists(), (
                     f"Parquet not written for {ticker} after cold fetch"
@@ -765,16 +816,16 @@ class TestPriceCacheLoadProof:
         )
 
         # --- Step 2: 6 rapid repeat requests — ALL must be served from parquet ---
-        # _fetch_raw_yahoo is patched to RAISE — if it fires, the cache is broken.
+        # _fetch_alpaca is patched to RAISE — if it fires, the cache is broken.
         request_sequence = [
             "MSFT", "AAPL", "GOOGL",
             "NVDA", "MSFT", "AAPL",
         ]
         results: list[tuple[str, str, int]] = []
 
-        with patch("round_table_portfolio.data_tools.price_cache._fetch_raw_yahoo",
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
                    side_effect=AssertionError(
-                       "429 sentinel: _fetch_raw_yahoo called on cache hit — "
+                       "Alpaca sentinel: _fetch_alpaca called on cache hit — "
                        "lazy weekly cache is not serving repeat requests"
                    )):
             for ticker in request_sequence:
@@ -786,13 +837,13 @@ class TestPriceCacheLoadProof:
         assert len(results) == 6
         for ticker, source, bar_count in results:
             assert bar_count > 0, f"{ticker}: 0 bars from cache"
-            assert source == "raw_yahoo", (
-                f"{ticker}: expected source='raw_yahoo' on cache hit, got {source!r}"
+            assert source == "alpaca", (
+                f"{ticker}: expected source='alpaca' on cache hit, got {source!r}"
             )
 
         print(
             f"\nLOAD TEST PASS (lazy weekly cache): "
-            f"4 cold fetches (1 per distinct ticker, paced at {pcmod._COLD_FETCH_PACE_SECS}s); "
+            f"4 cold fetches (1 per distinct ticker); "
             f"then 6/6 rapid repeat requests served from parquet — "
             f"0 network calls on warm path → 0 × 429 under persona load. "
             f"Bar counts per repeat: { {t: c for t, _, c in results} }"
@@ -1111,6 +1162,181 @@ class TestComputeTechnicals:
             from round_table_portfolio.data_tools.technical_tools import compute_technicals
             with pytest.raises(RuntimeError, match="Technical indicator computation failed"):
                 compute_technicals("AAPL", candle=candle)
+
+
+# ---------------------------------------------------------------------------
+# BUG-002 regression — price cache depth-aware + fallback-safe
+# ---------------------------------------------------------------------------
+
+class TestPriceCacheBug002:
+    """Regression tests for BUG-002: stale 1-bar and short-window cache poisoning.
+
+    Two failure modes closed:
+      1. Fallback-poison: Finnhub single-bar quote written to history cache;
+         later callers wanting real history received 1 bar.
+      2. Depth-cap: short-window request (e.g. prices NVDA 30) capped the cache
+         at ~21 bars; later callers needing ≥200 bars for SMA-200 got 21.
+    """
+
+    def test_finnhub_fallback_does_not_poison_history_cache(
+        self, tmp_state: Path, mock_finnhub_client: MagicMock
+    ) -> None:
+        """After a Finnhub quote fallback, the history cache must stay empty.
+
+        A subsequent get_cached_prices call must see a miss (not a 1-bar hit)
+        so it can re-attempt Alpaca for real history.
+        """
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        mock_finnhub_client.quote.return_value = {
+            "c": 150.0, "h": 152.0, "l": 149.0, "o": 151.0, "t": 1700000000
+        }
+        week_id = "2026-W88"
+
+        # Alpaca fails → Finnhub fallback fires
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   return_value=None), \
+             patch("round_table_portfolio.data_tools.finnhub_tools._get_client",
+                   return_value=mock_finnhub_client), \
+             patch("round_table_portfolio.data_tools.rate_limiter.FINNHUB_LIMITER.acquire"):
+            import round_table_portfolio.data_tools.finnhub_tools as ft
+            result = ft.get_prices("NVDA", week_id=week_id)
+
+        assert result.source == "finnhub_quote"
+        assert len(result.c) == 1
+
+        # Cache must be empty — 1-bar quote must not have been written
+        cache_path = pcmod._CACHE_DIR / week_id / "NVDA.parquet"
+        assert not cache_path.exists(), (
+            "Finnhub quote fallback must NOT write to history cache"
+        )
+
+        # Now simulate Alpaca recovering: get_cached_prices must see a miss
+        # and fire a real fetch (not return a 1-bar cache hit).
+        fetch_calls = {"n": 0}
+
+        def fake_alpaca(ticker, days):
+            fetch_calls["n"] += 1
+            return _make_ticker_df(n_bars=250)
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   side_effect=fake_alpaca):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            df = get_cached_prices("NVDA", week_id=week_id, days=365)
+
+        assert fetch_calls["n"] == 1, (
+            "Should have re-fetched Alpaca — cache must have been empty after fallback"
+        )
+        assert df is not None and len(df) > 1
+
+    def test_short_window_request_does_not_cap_canonical_cache(
+        self, tmp_state: Path
+    ) -> None:
+        """A 30-day request must not limit what the cache stores.
+
+        After prices NVDA 30 (cold fetch), a subsequent request for 365 days
+        must get the full canonical history — not a 21-bar truncated entry.
+        """
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        week_id = "2026-W89"
+        fetch_calls = {"n": 0, "days_arg": None}
+
+        def fake_alpaca(ticker, days):
+            fetch_calls["n"] += 1
+            fetch_calls["days_arg"] = days
+            # Return a frame as long as requested
+            return _make_ticker_df(n_bars=days)
+
+        from round_table_portfolio.data_tools.price_cache import get_cached_prices
+
+        # First call: short window (30 days)
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   side_effect=fake_alpaca):
+            result_short = get_cached_prices("NVDA", week_id=week_id, days=30)
+
+        assert fetch_calls["n"] == 1
+        # Canonical fetch depth must be ≥ _CANONICAL_DAYS (365), NOT just 30
+        assert fetch_calls["days_arg"] >= pcmod._CANONICAL_DAYS, (
+            f"Cold fetch should use canonical depth ≥{pcmod._CANONICAL_DAYS}, "
+            f"got {fetch_calls['days_arg']}"
+        )
+
+        # Second call: long window — must hit cache and return full canonical bars
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   side_effect=AssertionError("must not re-fetch on cache hit")):
+            result_long = get_cached_prices("NVDA", week_id=week_id, days=365)
+
+        assert result_long is not None
+        # The canonical cache (365 bars) must satisfy a 365-day long request (≥200 bars
+        # needed for SMA-200).  The key invariant is NOT "more than short" but "enough
+        # for long-lookback indicators" — the short request got a 30-day slice, the long
+        # request gets the full canonical depth.
+        assert len(result_long) >= 200, (
+            f"365-day request from canonical cache should yield ≥200 bars, got {len(result_long)}"
+        )
+        assert len(result_long) >= len(result_short), (
+            "Long-window request must not return fewer bars than the short slice"
+        )
+
+    def test_technicals_gets_enough_bars_for_sma_200(
+        self, tmp_state: Path
+    ) -> None:
+        """compute_technicals (via get_prices) must receive ≥200 bars for SMA-200.
+
+        This validates the depth end-to-end: get_prices() with default days=365
+        must yield a candle with enough bars that sma_200 is non-null.
+        """
+        # Build a canonical 365-bar frame (>200 trading days)
+        canonical_df = _make_ticker_df(n_bars=365)
+
+        week_id = "2026-W90"
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   return_value=canonical_df):
+            import round_table_portfolio.data_tools.finnhub_tools as ft
+            candle = ft.get_prices("NVDA", week_id=week_id, days=365)
+
+        assert len(candle.c) >= 200, (
+            f"Expected ≥200 bars for SMA-200, got {len(candle.c)}"
+        )
+
+        from round_table_portfolio.data_tools.technical_tools import compute_technicals
+        result = compute_technicals("NVDA", candle=candle)
+
+        assert result.sma_200 is not None, (
+            "SMA-200 must be non-null when ≥200 bars are available"
+        )
+        assert result.bars_available >= 200
+
+    def test_long_window_after_short_cache_hit_returns_canonical_bars(
+        self, tmp_state: Path
+    ) -> None:
+        """After a 30-day cold fetch writes the canonical cache, a 250-day
+        request served from the same cache entry must return ≥200 bars
+        (the canonical window, not the 30-day slice).
+        """
+        import round_table_portfolio.data_tools.price_cache as pcmod
+
+        week_id = "2026-W91"
+        # Canonical fetch stores 365 bars
+        canonical_df = _make_ticker_df(n_bars=365)
+
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   return_value=canonical_df):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            # Short request seeds the cache
+            get_cached_prices("AAPL", week_id=week_id, days=30)
+
+        # Long request must come from the canonical cache entry
+        with patch("round_table_portfolio.data_tools.price_cache._fetch_alpaca",
+                   side_effect=AssertionError("should not re-fetch — canonical cache exists")):
+            from round_table_portfolio.data_tools.price_cache import get_cached_prices
+            result = get_cached_prices("AAPL", week_id=week_id, days=250)
+
+        assert result is not None
+        assert len(result) >= 200, (
+            f"250-day request from canonical cache should yield ≥200 bars, got {len(result)}"
+        )
 
 
 # ---------------------------------------------------------------------------

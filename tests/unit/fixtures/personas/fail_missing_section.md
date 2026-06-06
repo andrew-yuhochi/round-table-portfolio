@@ -55,7 +55,7 @@ Weight constraint: 0 <= weight <= max_position_weight.
 {
   "round": 1,
   "stances": [{"ticker": "<T>", "action": "HOLD", "target_weight": 0.0, "confidence": 3, "rationale": "<...>"}],
-  "counterfactual_portfolio": {"<ticker>": 0.0},
+  "counterfactual_portfolio": {"<ticker>": 0.0, "CASH": 0.0},
   "narrative_summary": "<thesis>"
 }
 ```

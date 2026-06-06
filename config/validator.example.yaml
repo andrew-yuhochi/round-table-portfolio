@@ -1,0 +1,311 @@
+# config/validator.yaml — Per-persona output validator configuration.
+#
+# Two sections:
+#   structural:  deterministic-gate thresholds (no LLM call involved)
+#   personas:    per-persona on-mandate concept lists fed to the LLM-judge prompt
+#
+# Founder calibration knob: edit `on_mandate_concepts` and `off_mandate_signals`
+# per persona to tighten or relax the judge's reference frame.  A
+# founder-disagreement with the judge calibration is a Directional change
+# (TDD Component 11 Failure Handling) — revise here + the judge prompt together.
+
+structural:
+  # Minimum total character count for a report to pass the structural gate.
+  # A one-sentence verdict with no rationale typically tops out at ~120 chars.
+  min_report_chars: 300
+
+  # Minimum number of ticker symbols referenced in the report body.
+  # A valid per-name rationale report must mention at least this many tickers.
+  min_ticker_references: 2
+
+  # Minimum number of distinct financial/investment metric terms the report
+  # must contain.  Catches bare verdicts that are long enough to pass the char
+  # floor but lack any substantive data vocabulary.  Real detailed reports
+  # score 6–24; bare-verdict reports score 1–3.  Threshold of 5 sits cleanly
+  # between those populations.
+  min_metric_terms: 5
+
+  # Vocabulary that counts toward the metric-term density floor above.
+  # Covers equity valuation, macro/regime, systematic/technical, and
+  # evidence-source language — deliberately broad so any persona's detailed
+  # prose passes, while one-liner verdicts with no financial content fail.
+  metric_terms:
+    # Equity valuation
+    - "p/e"
+    - "p/b"
+    - "fcf"
+    - "ebitda"
+    - "revenue"
+    - "earnings"
+    - "yield"
+    - "margin"
+    - "growth"
+    - "valuation"
+    - "discount"
+    - "multiple"
+    - "ratio"
+    - "dividend"
+    - "gross margin"
+    - "net debt"
+    - "interest"
+    - "book value"
+    - "free cash flow"
+    - "balance sheet"
+    - "market cap"
+    - "intrinsic"
+    - "owner earnings"
+    # Technical / systematic
+    - "rsi"
+    - "macd"
+    - "momentum"
+    - "signal"
+    - "moving average"
+    - "volatility"
+    - "drawdown"
+    - "correlation"
+    - "factor"
+    - "breadth"
+    - "relative strength"
+    # Macro / regime
+    - "regime"
+    - "macro"
+    - "inflation"
+    - "yield curve"
+    - "liquidity"
+    - "duration"
+    - "carry"
+    - "fed"
+    - "rate"
+    - "credit"
+    - "cycle"
+    - "sector rotation"
+    # Evidence / source vocabulary
+    - "fundamentals"
+    - "technicals"
+    - "10-k"
+    - "10-q"
+    - "sec filing"
+    - "price"
+    - "return"
+    - "risk"
+    - "tail"
+    - "stress"
+    - "concentration"
+
+  # Keywords that collectively signal a data source was consulted.
+  # The gate checks that at least one appears in the report.
+  data_source_signals:
+    - "p/e"
+    - "p/b"
+    - "fcf"
+    - "ebitda"
+    - "revenue"
+    - "earnings"
+    - "rsi"
+    - "macd"
+    - "momentum"
+    - "fed"
+    - "yield curve"
+    - "macro"
+    - "cpi"
+    - "factor"
+    - "volatility"
+    - "drawdown"
+    - "correlation"
+    - "sec filing"
+    - "10-k"
+    - "10-q"
+    - "fundamentals"
+    - "technicals"
+    - "prices"
+
+personas:
+  value:
+    # Core lens this persona MUST reason through.
+    on_mandate_concepts:
+      - "intrinsic value"
+      - "margin of safety"
+      - "free cash flow"
+      - "FCF yield"
+      - "P/E"
+      - "P/B"
+      - "balance sheet"
+      - "earnings quality"
+      - "competitive moat"
+      - "valuation discount"
+      - "owner earnings"
+      - "net debt"
+      - "interest coverage"
+    # Signals that suggest the report has drifted into another persona's lens.
+    off_mandate_signals:
+      - "momentum"
+      - "trend"
+      - "RSI"
+      - "MACD"
+      - "breakout"
+      - "TAM"
+      - "revenue growth rate"
+      - "market share trajectory"
+      - "regime"
+      - "yield curve"
+      - "Fed policy"
+      - "factor score"
+      - "cross-sectional"
+      - "VaR"
+      - "drawdown"
+
+  growth:
+    on_mandate_concepts:
+      - "revenue growth"
+      - "earnings growth"
+      - "reinvestment runway"
+      - "total addressable market"
+      - "TAM"
+      - "gross margin"
+      - "compounding"
+      - "competitive moat"
+      - "returns on incremental capital"
+      - "market share"
+    off_mandate_signals:
+      - "margin of safety"
+      - "intrinsic value discount"
+      - "mean reversion"
+      - "P/B cheap"
+      - "RSI"
+      - "MACD"
+      - "trend following"
+      - "regime"
+      - "yield curve"
+      - "Fed"
+      - "factor score"
+      - "cross-sectional"
+      - "VaR"
+      - "drawdown"
+
+  technical:
+    on_mandate_concepts:
+      - "trend"
+      - "momentum"
+      - "RSI"
+      - "MACD"
+      - "support"
+      - "resistance"
+      - "breakout"
+      - "relative strength"
+      - "volume"
+      - "accumulation"
+      - "chart structure"
+    off_mandate_signals:
+      - "P/E"
+      - "P/B"
+      - "FCF"
+      - "intrinsic value"
+      - "balance sheet"
+      - "revenue growth"
+      - "TAM"
+      - "Fed policy"
+      - "yield curve"
+      - "regime"
+      - "factor score"
+      - "drawdown"
+      - "correlation"
+
+  discretionary-macro:
+    on_mandate_concepts:
+      - "Fed"
+      - "yield curve"
+      - "inflation"
+      - "CPI"
+      - "PCE"
+      - "business cycle"
+      - "liquidity"
+      - "credit conditions"
+      - "regime"
+      - "macro thesis"
+      - "sector rotation"
+    off_mandate_signals:
+      - "P/E"
+      - "FCF yield"
+      - "RSI"
+      - "MACD"
+      - "breakout"
+      - "factor score"
+      - "cross-sectional"
+      - "valuation screen"
+      - "VaR"
+      - "portfolio correlation"
+
+  cta-systematic-macro:
+    on_mandate_concepts:
+      - "signal"
+      - "momentum signal"
+      - "trend strength"
+      - "persistence"
+      - "cross-sectional momentum"
+      - "time-series momentum"
+      - "moving average"
+      - "carry"
+      - "volatility-scaled"
+    off_mandate_signals:
+      - "narrative"
+      - "regime thesis"
+      - "Fed story"
+      - "P/E"
+      - "FCF"
+      - "intrinsic value"
+      - "growth runway"
+      - "TAM"
+      - "drawdown risk"
+      - "portfolio correlation"
+      - "factor score"
+
+  quant-systematic:
+    on_mandate_concepts:
+      - "factor score"
+      - "cross-sectional"
+      - "value factor"
+      - "momentum factor"
+      - "quality factor"
+      - "low volatility"
+      - "size factor"
+      - "breadth"
+      - "diversification"
+      - "factor crowding"
+    off_mandate_signals:
+      - "narrative"
+      - "intrinsic value"
+      - "margin of safety"
+      - "Fed"
+      - "yield curve"
+      - "regime"
+      - "RSI"
+      - "chart structure"
+      - "breakout"
+      - "VaR"
+      - "drawdown"
+
+  risk-officer:
+    on_mandate_concepts:
+      - "concentration"
+      - "correlation"
+      - "volatility"
+      - "drawdown"
+      - "tail risk"
+      - "VaR"
+      - "stress"
+      - "portfolio risk"
+      - "position sizing"
+      - "downside"
+      - "liquidity"
+    off_mandate_signals:
+      - "intrinsic value"
+      - "FCF yield"
+      - "growth runway"
+      - "TAM"
+      - "RSI"
+      - "breakout"
+      - "trend"
+      - "factor score"
+      - "regime"
+      - "Fed"
+      - "multi-bagger"

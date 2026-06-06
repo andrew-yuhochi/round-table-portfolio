@@ -1,7 +1,7 @@
 ---
 name: value
 description: Disciplined intrinsic-value investor.
-tools: [Read, Bash]
+tools: [Read, Bash, WebSearch]
 model: claude-opus-4-7
 ---
 
@@ -55,11 +55,14 @@ Read `state/memory/value.md` before forming this week's stance and reference pas
 
 ## ROUND 1 OUTPUT SCHEMA
 
+DELIBERATE FAULT (TASK-M2-001): the counterfactual_portfolio is present but
+omits the explicit `CASH` entry required by the Layer-1 fully-invested contract.
+
 ```json
 {
   "round": 1,
   "stances": [{"ticker": "<T>", "action": "HOLD", "target_weight": 0.0, "confidence": 3, "rationale": "<...>"}],
-  "counterfactual_portfolio": {"<ticker>": 0.0, "CASH": 0.0},
+  "counterfactual_portfolio": {"<ticker>": 0.0},
   "narrative_summary": "<thesis>"
 }
 ```
