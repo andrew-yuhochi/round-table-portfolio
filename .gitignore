@@ -31,6 +31,7 @@ config/*.toml
 !config/fred_series.yaml
 !config/rss_feeds.yaml
 !config/persona_budgets.yaml
+!config/thresholds.yaml
 
 # OS / editor
 .DS_Store

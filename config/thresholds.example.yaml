@@ -1,0 +1,5 @@
+# Portfolio invariant thresholds — example / publish-safe copy
+#
+# Copy to thresholds.yaml and adjust for your mandate design.
+# max_position_weight: hard per-ticker weight ceiling (e.g. 0.20 = 20%).
+max_position_weight: 0.20

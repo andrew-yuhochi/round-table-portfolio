@@ -1,5 +1,14 @@
 """Unit tests for Component 11 — per-persona output validator.
 
+M2 additions (TASK-M2-002)
+--------------------------
+Section 6: fully-invested gate (clause c) — 5 fixtures covering the 3 malformed
+  and 2 well-formed cases from Component 11 Quality Criterion 5.
+Section 7: single-source guarantee (AC3) — the validator uses check_fully_invested
+  from portfolio/invariants.py (same symbol Component 15 imports).
+Section 8: zero-judge-dispatch confirmation — fully-invested failures short-circuit
+  before the judge (MagicMock proves no judge.judge() call is made).
+
 Test structure
 --------------
 1. Config loading — load_validator_config() from a real config file.
@@ -41,6 +50,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from round_table_portfolio.personas.output_validator import (
+    STAGE_FULLY_INVESTED,
     STAGE_LLM_JUDGE,
     STAGE_STRUCTURAL,
     OnMandateJudge,
@@ -49,6 +59,7 @@ from round_table_portfolio.personas.output_validator import (
     ValidatorConfig,
     parse_judge_response,
     _run_structural_gate,
+    _run_fully_invested_gate,
     load_validator_config,
     validate_persona_report,
 )
@@ -576,3 +587,221 @@ class TestOnMandateJudgeProtocol:
                 persona_slug="value",
                 judge=None,
             )
+
+
+# ---------------------------------------------------------------------------
+# Section 6 — Fully-invested gate fixtures (TASK-M2-002, clause c)
+# 5 fixtures: 3 malformed → FLAG, 2 well-formed → PASS.
+# All deterministic — 100% pass rate required (Quality Criterion 5).
+# ---------------------------------------------------------------------------
+
+# These portfolios are the canonical representations for the 5 fixtures.
+# The .md files in fixtures/reports/ carry the full report text + a comment
+# block documenting the portfolio structure.  Tests inline the portfolios here
+# so the assertion is self-contained and the fixture provenance is explicit.
+
+_FI_MALFORMED_095 = {
+    "AAPL": 0.30, "MSFT": 0.30, "NVDA": 0.25, "CASH": 0.10,
+}  # total = 0.95, under-invested
+
+_FI_MALFORMED_105 = {
+    "AAPL": 0.40, "MSFT": 0.40, "NVDA": 0.25, "CASH": 0.00,
+}  # total = 1.05, over-invested
+
+_FI_MALFORMED_OVER_CAP = {
+    "AAPL": 0.25, "MSFT": 0.15, "CASH": 0.60,
+}  # AAPL = 0.25 > max_position_weight = 0.20
+
+_FI_WELLFORMED_INVESTED = {
+    "AAPL": 0.20, "MSFT": 0.20, "NVDA": 0.20, "CASH": 0.40,
+}  # total = 1.00, no weight over 0.20
+
+_FI_WELLFORMED_HIGH_CASH = {
+    "AAPL": 0.15, "CASH": 0.85,
+}  # total = 1.00, high cash is valid mechanics
+
+
+_MAX_POS_WEIGHT = 0.20  # matches config/thresholds.yaml default
+
+
+class TestFullyInvestedGateDirect:
+    """Direct tests of _run_fully_invested_gate — 100% deterministic."""
+
+    def test_malformed_sums_to_095_flags(self) -> None:
+        """sums-to-0.95-no-CASH fixture → FULLY-INVESTED GATE FAIL."""
+        result = _run_fully_invested_gate(_FI_MALFORMED_095, _MAX_POS_WEIGHT)
+        assert not result.passed, (
+            f"Malformed 0.95 portfolio should FLAG. Notes: {result.notes}"
+        )
+        assert result.stage == STAGE_FULLY_INVESTED
+        assert "FULLY-INVESTED GATE FAIL" in result.notes
+
+    def test_malformed_sums_to_105_flags(self) -> None:
+        """sums-to-1.05-over-invested fixture → FULLY-INVESTED GATE FAIL."""
+        result = _run_fully_invested_gate(_FI_MALFORMED_105, _MAX_POS_WEIGHT)
+        assert not result.passed, (
+            f"Malformed 1.05 portfolio should FLAG. Notes: {result.notes}"
+        )
+        assert result.stage == STAGE_FULLY_INVESTED
+        assert "FULLY-INVESTED GATE FAIL" in result.notes
+
+    def test_malformed_single_weight_over_cap_flags(self) -> None:
+        """single-weight-over-cap fixture (AAPL=0.25 > cap=0.20) → FULLY-INVESTED GATE FAIL."""
+        result = _run_fully_invested_gate(_FI_MALFORMED_OVER_CAP, _MAX_POS_WEIGHT)
+        assert not result.passed, (
+            f"Over-cap portfolio should FLAG. Notes: {result.notes}"
+        )
+        assert result.stage == STAGE_FULLY_INVESTED
+        assert "FULLY-INVESTED GATE FAIL" in result.notes
+
+    def test_wellformed_invested_passes(self) -> None:
+        """Well-formed positions+CASH=1.0 portfolio → PASS."""
+        result = _run_fully_invested_gate(_FI_WELLFORMED_INVESTED, _MAX_POS_WEIGHT)
+        assert result.passed, (
+            f"Well-formed portfolio should PASS. Notes: {result.notes}"
+        )
+        assert result.stage == STAGE_FULLY_INVESTED
+
+    def test_wellformed_high_cash_passes(self) -> None:
+        """Well-formed high-cash portfolio (AAPL=0.15, CASH=0.85) → PASS.
+
+        High cash is a valid mechanical state — the gate checks sum-to-1.0
+        only; whether the cash level is appropriate stays with the on-mandate
+        judge.
+        """
+        result = _run_fully_invested_gate(_FI_WELLFORMED_HIGH_CASH, _MAX_POS_WEIGHT)
+        assert result.passed, (
+            f"High-cash portfolio should PASS the mechanics check. Notes: {result.notes}"
+        )
+        assert result.stage == STAGE_FULLY_INVESTED
+
+
+class TestFullyInvestedViaValidatePersonaReport:
+    """End-to-end: the gate runs inside validate_persona_report when
+    counterfactual_portfolio is supplied, and still short-circuits before judge."""
+
+    def test_malformed_portfolio_fails_before_judge(self) -> None:
+        """A structurally-valid report with a malformed portfolio must fail at
+        STAGE_FULLY_INVESTED without reaching the judge."""
+        report = _load("fi_malformed_sums_to_095.md")
+        cfg = _cfg()
+        mock_judge = MagicMock(
+            side_effect=AssertionError("judge must not be called on a fully-invested gate failure")
+        )
+        result = validate_persona_report(
+            report=report,
+            mandate=_mandate("value"),
+            config=cfg,
+            persona_slug="value",
+            judge=mock_judge,
+            counterfactual_portfolio=_FI_MALFORMED_095,
+            max_position_weight=_MAX_POS_WEIGHT,
+        )
+        assert not result.passed
+        assert result.stage == STAGE_FULLY_INVESTED
+        mock_judge.assert_not_called()
+
+    def test_wellformed_portfolio_reaches_judge(self) -> None:
+        """A structurally-valid report with a well-formed portfolio must pass the
+        fully-invested gate and proceed to the judge."""
+        report = _load("fi_wellformed_invested.md")
+        cfg = _cfg()
+        stub = _injected_stub("value", report, True, "On-mandate value reasoning.")
+        result = validate_persona_report(
+            report=report,
+            mandate=_mandate("value"),
+            config=cfg,
+            persona_slug="value",
+            judge=stub,
+            counterfactual_portfolio=_FI_WELLFORMED_INVESTED,
+            max_position_weight=_MAX_POS_WEIGHT,
+        )
+        assert result.passed
+        assert result.stage == STAGE_LLM_JUDGE
+
+    def test_no_portfolio_skips_gate(self) -> None:
+        """When counterfactual_portfolio is None the fully-invested gate is skipped
+        and the existing M1 behaviour is unchanged."""
+        report = _load("on_mandate_value.md")
+        cfg = _cfg()
+        stub = _injected_stub("value", report, True, "On-mandate.")
+        result = validate_persona_report(
+            report=report,
+            mandate=_mandate("value"),
+            config=cfg,
+            persona_slug="value",
+            judge=stub,
+        )
+        assert result.passed
+        assert result.stage == STAGE_LLM_JUDGE
+
+
+# ---------------------------------------------------------------------------
+# Section 7 — Single-source guarantee (AC3)
+# ---------------------------------------------------------------------------
+
+class TestSingleSourceHelper:
+    def test_output_validator_uses_check_fully_invested_from_invariants(self) -> None:
+        """The validator's internal _run_fully_invested_gate delegates to
+        check_fully_invested from portfolio/invariants.py — the SAME symbol
+        Component 15 (TASK-M2-005) will import.
+
+        Proof: _run_fully_invested_gate is importable, and the module it lives
+        in imports check_fully_invested from portfolio.invariants.  We confirm
+        by asserting both import paths resolve to the same callable.
+        """
+        from round_table_portfolio.portfolio.invariants import (
+            check_fully_invested as invariants_fn,
+        )
+        import round_table_portfolio.personas.output_validator as ov_module
+        # The output_validator module must expose check_fully_invested via its
+        # own namespace (imported at module level).
+        assert hasattr(ov_module, "check_fully_invested"), (
+            "output_validator.py must import check_fully_invested from portfolio.invariants "
+            "at module level so Component 15 can import the same symbol."
+        )
+        assert ov_module.check_fully_invested is invariants_fn, (
+            "output_validator.check_fully_invested must be the same object as "
+            "portfolio.invariants.check_fully_invested — single arithmetic source."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 8 — Zero-judge-dispatch confirmation
+# ---------------------------------------------------------------------------
+
+class TestZeroJudgeDispatch:
+    """Fully-invested failures must consume ZERO judge dispatches.
+
+    Each test injects a MagicMock judge with side_effect=AssertionError.
+    If the gate ever calls judge.judge(), the mock fires and the test fails —
+    proving the short-circuit held.
+    """
+
+    @pytest.mark.parametrize("portfolio,label", [
+        (_FI_MALFORMED_095, "sums-to-0.95"),
+        (_FI_MALFORMED_105, "sums-to-1.05-over-invested"),
+        (_FI_MALFORMED_OVER_CAP, "single-weight-over-cap"),
+    ])
+    def test_malformed_portfolio_never_dispatches_judge(
+        self, portfolio: dict, label: str
+    ) -> None:
+        report = _load("on_mandate_value.md")  # structurally valid — gate 1 passes
+        cfg = _cfg()
+        mock_judge = MagicMock(
+            side_effect=AssertionError(
+                f"judge must not be called for {label} — fully-invested gate must short-circuit"
+            )
+        )
+        result = validate_persona_report(
+            report=report,
+            mandate=_mandate("value"),
+            config=cfg,
+            persona_slug="value",
+            judge=mock_judge,
+            counterfactual_portfolio=portfolio,
+            max_position_weight=_MAX_POS_WEIGHT,
+        )
+        assert not result.passed, f"{label}: expected FLAG but got PASS"
+        assert result.stage == STAGE_FULLY_INVESTED
+        mock_judge.assert_not_called()

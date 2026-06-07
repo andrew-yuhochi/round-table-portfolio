@@ -9,6 +9,13 @@ Entry point::
     result = validate_persona_report(report, mandate, config, judge=judge)
     # result.passed bool, result.notes str, result.stage str
 
+    # From M2: pass counterfactual_portfolio to add the fully-invested gate (clause c).
+    result = validate_persona_report(
+        report, mandate, config, judge=judge,
+        counterfactual_portfolio={"AAPL": 0.10, "MSFT": 0.10, "CASH": 0.80},
+        max_position_weight=0.20,
+    )
+
 The concrete on-mandate judge (``OnMandateJudge`` implementor) is wired at the
 orchestration layer (TASK-M1-010 runner), NOT inside this module.  This module
 exposes:
@@ -36,6 +43,8 @@ from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 import yaml
+
+from round_table_portfolio.portfolio.invariants import check_fully_invested
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +110,7 @@ def load_validator_config(config_path: Optional[Path] = None) -> ValidatorConfig
 # ---------------------------------------------------------------------------
 
 STAGE_STRUCTURAL = "structural"
+STAGE_FULLY_INVESTED = "fully_invested"
 STAGE_LLM_JUDGE = "llm_judge"
 
 
@@ -145,6 +155,40 @@ _TICKER_EXCLUDE: frozenset[str] = frozenset({
     "REIT", "SPAC", "AI", "ML", "US", "UK", "EU", "USD",
     "GPU", "FSD", "AWS", "PBM",
 })
+
+
+def _run_fully_invested_gate(
+    counterfactual_portfolio: dict[str, float],
+    max_position_weight: float,
+) -> ReportValidationResult:
+    """Clause (c) of the deterministic structural gate — fully-invested check.
+
+    Splits ``counterfactual_portfolio`` into ``positions`` (everything except
+    the ``CASH`` key) and ``cash``, then delegates all arithmetic to
+    ``check_fully_invested`` from ``portfolio/invariants.py``.
+
+    This is the SINGLE call site for the Layer-2 invariant check.  Component 15
+    (TASK-M2-005) calls the same ``check_fully_invested`` helper directly —
+    both sites share identical arithmetic (the "intentionally identical
+    arithmetic" guarantee).
+
+    Does NOT judge cash level — only mechanical sum-to-100% is checked here.
+    """
+    cash = counterfactual_portfolio.get("CASH", 0.0)
+    positions = {k: v for k, v in counterfactual_portfolio.items() if k != "CASH"}
+
+    passed, reasons = check_fully_invested(positions, cash, max_position_weight)
+
+    if not passed:
+        notes = "FULLY-INVESTED GATE FAIL — " + " | ".join(reasons)
+        logger.debug("Fully-invested gate failed: %s", notes)
+        return ReportValidationResult(passed=False, notes=notes, stage=STAGE_FULLY_INVESTED)
+
+    return ReportValidationResult(
+        passed=True,
+        notes="Fully-invested gate passed.",
+        stage=STAGE_FULLY_INVESTED,
+    )
 
 
 def _run_structural_gate(
@@ -363,6 +407,9 @@ def validate_persona_report(
     config: ValidatorConfig,
     persona_slug: str = "",
     judge: Optional[OnMandateJudge] = None,
+    *,
+    counterfactual_portfolio: Optional[dict[str, float]] = None,
+    max_position_weight: float = 0.20,
 ) -> ReportValidationResult:
     """Validate a persona report against its mandate.
 
@@ -370,7 +417,16 @@ def validate_persona_report(
         Checks minimum length, required sections, ticker count, data-source
         signals.  Failure short-circuits; no judge call is made.
 
-    Stage 2 — On-mandate judge (only if Stage 1 passes):
+    Stage 1b — Fully-invested gate (clause c, M2, optional):
+        When ``counterfactual_portfolio`` is provided, the deterministic gate
+        additionally asserts the portfolio sums to 1.0 within 1e-6, cash ≥ 0,
+        all weights ≥ 0, and no single position weight > ``max_position_weight``.
+        Uses ``check_fully_invested`` from ``portfolio/invariants.py`` — the
+        SAME helper Component 15 (Layer-3 backstop) calls.  A portfolio failure
+        short-circuits to ``passed=False`` without dispatching the judge.
+        Does NOT judge cash level — only mechanical sum-to-100%.
+
+    Stage 2 — On-mandate judge (only if stages 1/1b pass):
         The injected judge reads the report + mandate and returns pass/fail +
         one-paragraph justification.  In production this is a subagent dispatch
         (wired by the TASK-M1-010 runner); in tests it is a StubOnMandateJudge.
@@ -386,6 +442,13 @@ def validate_persona_report(
                tests.  In production the runner passes its subagent-dispatch
                implementation.  Raises ``ValueError`` if None — the orchestration
                layer must always wire a concrete judge; there is no default.
+        counterfactual_portfolio: Optional mapping of ticker → weight including
+               an explicit ``"CASH"`` key.  When present, the fully-invested
+               structural check (clause c) runs before the LLM judge.
+        max_position_weight: Per-ticker hard ceiling; read from
+               ``config/thresholds.yaml`` by the caller and passed in.
+               Defaults to 0.20 but callers should always pass the configured
+               value — the default is a safety net, not the source of truth.
 
     Returns:
         ``ReportValidationResult`` with ``passed``, ``notes``, ``stage``, and
@@ -399,6 +462,12 @@ def validate_persona_report(
     structural_result = _run_structural_gate(report, config.structural)
     if not structural_result.passed:
         return structural_result
+
+    # Stage 1b — fully-invested gate (clause c, M2).
+    if counterfactual_portfolio is not None:
+        fi_result = _run_fully_invested_gate(counterfactual_portfolio, max_position_weight)
+        if not fi_result.passed:
+            return fi_result
 
     # Stage 2 — on-mandate judge.
     if judge is None:
