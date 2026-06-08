@@ -3,3 +3,5 @@
 # Copy to thresholds.yaml and adjust for your mandate design.
 # max_position_weight: hard per-ticker weight ceiling (e.g. 0.20 = 20%).
 max_position_weight: 0.20
+dissent_std_dev_threshold: 0.08
+run_window_hours: 5.0

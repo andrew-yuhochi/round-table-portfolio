@@ -1,0 +1,14 @@
+# web_search.example.yaml — Template for web-search configuration.
+# Copy to web_search.yaml and set your preferred values.
+
+cost_ceiling_usd: 5.00
+provider: tavily
+timeout_seconds: 30
+
+# Rolling-window feasibility thresholds (Critical Component #3).
+# window_hours: the Claude rolling-window limit; default 5.0 hours.
+# window_proximity_threshold: fraction of the window at which the bounding-playbook
+#   escalation fires (fewer personas / tighter budgets / tier upgrade).
+#   0.80 = 80% → 4h of the 5h window triggers escalation.
+window_hours: 5.0
+window_proximity_threshold: 0.80

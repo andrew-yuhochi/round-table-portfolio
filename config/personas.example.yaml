@@ -1,0 +1,12 @@
+# personas.example.yaml — Template for the persona roster config.
+# Copy to personas.yaml and adjust slugs to match your panel composition.
+# Slugs must match the portfolios.type CHECK constraint in schema.sql.
+
+slugs:
+  - value
+  - growth
+  - discretionary-macro
+  - cta-systematic-macro
+  - technical
+  - quant-systematic
+  - risk-officer

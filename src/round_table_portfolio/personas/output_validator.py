@@ -379,6 +379,98 @@ class StubOnMandateJudge:
         )
 
 
+# ---------------------------------------------------------------------------
+# Validator-claim persistence (M1-014 / Component 20)
+# ---------------------------------------------------------------------------
+
+def persist_validator_claim(
+    result: "ReportValidationResult",
+    week_id: str,
+    persona_slug: str,
+    *,
+    state_root: Path = Path("state"),
+) -> Path:
+    """Serialize a ReportValidationResult to a durable JSON claim file.
+
+    Writes ``state/reports/<week_id>/validator_claims/<persona_slug>.json``
+    (option-b path-convention — no schema change; the path is deterministically
+    reconstructable from ``week_id`` + ``persona_slug``).
+
+    The JSON contains every field on ``ReportValidationResult``:
+      - ``passed`` (bool) — PASS / FAIL
+      - ``notes`` (str)  — deterministic-gate flags or off-mandate description
+      - ``stage`` (str)  — which gate made the call
+      - ``llm_justification`` (str) — on-mandate judge justification (empty when
+        the structural or fully-invested gate short-circuited before the judge)
+
+    Note on "cited report-excerpt evidence": the judge justification
+    (``llm_justification``) contains the judge's cited phrases from the
+    report.  There is no separate ``evidence`` field on ``ReportValidationResult``
+    — the justification IS the evidence carrier.  This gap is documented in
+    the TASK-M2-010 quality log.
+
+    The file is re-loadable: ``ReportValidationResult(**json.load(f))`` reconstructs
+    the object (confirmed by round-trip tests).
+
+    Args:
+        result:       The validation verdict from ``validate_persona_report``.
+        week_id:      ISO week label e.g. "2026-W23".
+        persona_slug: e.g. "value", "technical".
+        state_root:   Root of the runtime state tree; defaults to Path("state").
+                      Tests pass tmp_path here.
+
+    Returns:
+        The Path of the written claim file.
+    """
+    import json as _json
+
+    claims_dir = state_root / "reports" / week_id / "validator_claims"
+    claims_dir.mkdir(parents=True, exist_ok=True)
+
+    claim_path = claims_dir / f"{persona_slug}.json"
+    payload = {
+        "week_id": week_id,
+        "persona": persona_slug,
+        "passed": result.passed,
+        "notes": result.notes,
+        "stage": result.stage,
+        "llm_justification": result.llm_justification,
+    }
+    claim_path.write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+    logger.debug(
+        "Validator claim written: week=%s persona=%s passed=%s path=%s",
+        week_id, persona_slug, result.passed, claim_path,
+    )
+    return claim_path
+
+
+def load_validator_claim(claim_path: Path) -> "ReportValidationResult":
+    """Re-load a persisted claim JSON into a ReportValidationResult.
+
+    Provides the round-trip path: write via ``persist_validator_claim``,
+    read back via this helper.
+
+    Args:
+        claim_path: Path to the ``.json`` file written by ``persist_validator_claim``.
+
+    Returns:
+        A ``ReportValidationResult`` reconstructed from the JSON payload.
+
+    Raises:
+        FileNotFoundError: If the claim file does not exist.
+        KeyError: If the JSON is missing a required field.
+    """
+    import json as _json
+
+    raw = _json.loads(claim_path.read_text(encoding="utf-8"))
+    return ReportValidationResult(
+        passed=bool(raw["passed"]),
+        notes=str(raw["notes"]),
+        stage=str(raw["stage"]),
+        llm_justification=str(raw.get("llm_justification", "")),
+    )
+
+
 def parse_judge_response(raw: str) -> tuple[bool, str]:
     """Parse the structured judge response into (passed, justification).
 
