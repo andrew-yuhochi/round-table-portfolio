@@ -191,6 +191,31 @@ def _run_fully_invested_gate(
     )
 
 
+def validate_counterfactual_portfolio(
+    counterfactual_portfolio: dict[str, float],
+    max_position_weight: float = 0.20,
+) -> ReportValidationResult:
+    """Public entry point for the Layer-2 counterfactual portfolio gate.
+
+    Checks that the portfolio is fully invested (positions + CASH == 1.0,
+    CASH >= 0, all weights >= 0, no single position weight > max_position_weight).
+    Does NOT inspect report prose — Layer-1 already ran the structural +
+    on-mandate gates on the full report text; Layer-2's sole job is this
+    portfolio-arithmetic check.
+
+    Args:
+        counterfactual_portfolio: Mapping of ticker → weight including an
+            explicit ``"CASH"`` key.
+        max_position_weight: Per-ticker hard ceiling; read from
+            ``config/thresholds.yaml`` by the caller.
+
+    Returns:
+        ``ReportValidationResult`` with ``passed``, ``notes``, and
+        ``stage=STAGE_FULLY_INVESTED``.
+    """
+    return _run_fully_invested_gate(counterfactual_portfolio, max_position_weight)
+
+
 def _run_structural_gate(
     report: str,
     cfg: StructuralConfig,
@@ -328,6 +353,41 @@ Respond with EXACTLY this format (no extra text):
 VERDICT: PASS  (or FAIL)
 JUSTIFICATION: <one paragraph explaining why, citing specific phrases from the report>
 """
+
+
+class ReplayJudge:
+    """Production judge that replays pre-captured verdicts from the session.
+
+    The session dispatches the ``output-validator-judge`` subagent once per
+    persona, parses the raw VERDICT/JUSTIFICATION response with
+    ``parse_judge_response``, and stores each result in a dict before calling
+    ``run_weekly``.  This class replays those captured verdicts so the engine
+    never needs to dispatch subagents directly.
+
+    Constructed with a mapping of ``{persona_slug: (passed, justification)}``.
+    ``judge()`` looks up the slug and returns the pre-captured pair.  A missing
+    slug raises ``KeyError`` immediately — a silent pass would hide a session
+    bookkeeping error.
+    """
+
+    def __init__(self, verdicts: dict[str, tuple[bool, str]]) -> None:
+        self._verdicts = verdicts
+
+    def judge(
+        self,
+        report: str,
+        mandate: str,
+        persona_slug: str,
+        on_mandate_concepts: tuple[str, ...],
+        off_mandate_signals: tuple[str, ...],
+    ) -> tuple[bool, str]:
+        if persona_slug not in self._verdicts:
+            raise KeyError(
+                f"ReplayJudge has no pre-captured verdict for persona_slug={persona_slug!r}. "
+                "Ensure the session dispatched the output-validator-judge subagent for every "
+                "persona and wrote the results to judge_verdicts.json before calling run_weekly."
+            )
+        return self._verdicts[persona_slug]
 
 
 class StubOnMandateJudge:

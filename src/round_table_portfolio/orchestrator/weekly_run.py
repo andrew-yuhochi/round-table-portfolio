@@ -65,6 +65,7 @@ from round_table_portfolio.personas.output_validator import (
     ValidatorConfig,
     load_validator_config,
     persist_validator_claim,
+    validate_counterfactual_portfolio,
     validate_persona_report,
 )
 from round_table_portfolio.research.runner import PersonaResearchResult, run_persona_research
@@ -657,14 +658,15 @@ def run_weekly(
         config={"max_position_weight": max_position_weight},
     )
 
-    # Layer-2 validate each counterfactual (M2-002 gate on the portfolio).
+    # Layer-2 validate each counterfactual (M2-002 portfolio-arithmetic gate only).
+    # Layer-1 already ran the report-prose structural + on-mandate gates on the
+    # FULL report text inside run_persona_research.  Layer-2's sole job is the
+    # fully-invested / CASH / per-position-cap invariant on the Round-1 portfolio.
+    # Passing the truncated summary to validate_persona_report re-ran the
+    # structural ticker gate on 500 chars and false-failed personas whose opening
+    # paragraph named fewer than 2 tickers (TASK-M2-011 bug).
     for slug, portfolio in round1.counterfactuals.items():
-        validation = validate_persona_report(
-            report=next(r.report_payload.summary for r in persona_results if r.persona_slug == slug),
-            mandate="",
-            config=v_config,
-            persona_slug=slug,
-            judge=_judge,
+        validation = validate_counterfactual_portfolio(
             counterfactual_portfolio=portfolio,
             max_position_weight=max_position_weight,
         )

@@ -903,3 +903,150 @@ class TestValidatorClaimsProduced:
 # ---------------------------------------------------------------------------
 # The test suite itself IS the AC #5 gate — pytest must report zero failures.
 # No additional test class needed; the above classes cover all deterministic ACs.
+
+
+# ---------------------------------------------------------------------------
+# Regression: TASK-M2-011 — Layer-2 must NOT re-run report-prose gates
+# ---------------------------------------------------------------------------
+
+def _make_persona_output_sparse_opening(slug: str) -> str:
+    """Persona report whose FIRST PARAGRAPH names zero tickers.
+
+    The opening sentence is deliberately ticker-free to reproduce the TASK-M2-011
+    failure: Layer-2 received the 500-char summary (= first paragraph) and ran
+    the structural ticker gate on it, false-failing personas with sparse openings.
+
+    The FULL report (later paragraphs) still contains ≥2 tickers and passes all
+    Layer-1 structural gates — so this fixture is valid at Layer-1 and must also
+    pass Layer-2 after the fix.
+    """
+    # First paragraph: no tickers, just narrative prose — deliberately >500 chars
+    # so _extract_summary(max_chars=500) returns only this ticker-free text.
+    opening = (
+        "The current macro environment presents compelling opportunities for "
+        "disciplined investors willing to look through near-term volatility. "
+        "Valuation dispersion across sectors is at a multi-year high, and "
+        "capital discipline has improved markedly since the rate-shock of 2022. "
+        "Central bank policy is on hold, credit spreads remain contained, and "
+        "earnings revision breadth has turned positive for the first time in "
+        "three quarters, suggesting the fundamental backdrop is improving even "
+        "as headline indices hover near all-time highs. "
+        "This report identifies three high-conviction ideas supported by "
+        "fundamental and quantitative research conducted across the full universe."
+    )
+    # Sanity-check: opening must exceed 500 chars so the summary window is
+    # entirely ticker-free (regression guard for this fixture itself).
+    assert len(opening) > 500, (
+        f"Opening paragraph is only {len(opening)} chars — must exceed 500 so "
+        "_extract_summary returns a ticker-free summary. Extend the prose."
+    )
+    # Subsequent paragraphs: tickers appear, passing the structural ≥2 gate on
+    # the FULL report but NOT on the first-paragraph summary alone.
+    body = (
+        " AAPL trades at 25× earnings with a strong FCF yield of 4.5% and "
+        "robust balance-sheet strength. MSFT shows revenue growth of 15% YoY "
+        "with cloud ARR acceleration. GOOGL offers search dominance and AI "
+        "optionality at a P/E of 20×. "
+        "Technical indicators: RSI 52, MACD neutral. Valuation metrics: P/E, "
+        "FCF, EPS growth. "
+        "Data sources consulted: EDGAR 10-K, FRED macro series, price history "
+        "via Alpaca. "
+        "Risk considerations: concentration in mega-cap tech. "
+        "Conviction: high for AAPL and MSFT; moderate for GOOGL. "
+        "Portfolio: AAPL 15%, MSFT 12%, GOOGL 10%, CASH 63%."
+    )
+    report_body = opening + body
+    schema = {
+        "shortlist": [
+            {"ticker": "AAPL", "why": "Strong FCF, capital return.", "cluster": ["QCOM"]},
+            {"ticker": "MSFT", "why": "Cloud moat.", "cluster": ["GOOGL"]},
+            {"ticker": "NVDA", "why": "AI infrastructure.", "cluster": ["AMD", "INTC"]},
+        ],
+        "report": report_body,
+        "web_searches_used": 4,
+        "data_tool_calls_used": 8,
+    }
+    return json.dumps(schema)
+
+
+class TestLayer2DoesNotReRunProseGates:
+    """Regression: TASK-M2-011.
+
+    A persona whose report's first paragraph contains 0 tickers (but whose FULL
+    report is structurally valid with ≥2 tickers) must PASS Layer-2 when its
+    counterfactual portfolio is fully invested.
+
+    Before the fix, Layer-2 passed `report_payload.summary` (= 500-char first
+    paragraph) to `validate_persona_report`, which re-ran the structural ticker
+    gate on that truncated text and raised RuntimeError even though Layer-1
+    already passed the full report.
+    """
+
+    def test_sparse_opening_persona_passes_layer2(
+        self,
+        run_env: dict,
+        week_id: str,
+    ) -> None:
+        """All 7 personas with ticker-free opening paragraphs must run to completion."""
+        # Persona replies: valid full reports but first paragraphs have 0 tickers.
+        sparse_replies = {
+            slug: _make_persona_output_sparse_opening(slug) for slug in PERSONA_SLUGS_7
+        }
+
+        # This must NOT raise RuntimeError about Layer-2 structural gate failure.
+        result = run_weekly(
+            "round-table-portfolio",
+            week_id=week_id,
+            persona_replies=sparse_replies,
+            founder_reply="approve",
+            judge=StubOnMandateJudge(),
+            **run_env,
+        )
+
+        # The run completed — 8 portfolios written, 7 persona reports.
+        counts = _row_counts(run_env["db_path"], week_id)
+        assert counts["portfolios"] == 8, (
+            f"Expected 8 portfolios after sparse-opening run, got {counts['portfolios']}. "
+            "Layer-2 may have incorrectly re-run the report-prose structural gate."
+        )
+        assert counts["persona_reports"] == 7, (
+            f"Expected 7 persona_reports, got {counts['persona_reports']}."
+        )
+
+    def test_sparse_opening_summary_would_fail_structural_gate(
+        self,
+        run_env: dict,
+    ) -> None:
+        """Confirm the first paragraph of the sparse-opening fixture actually contains
+        fewer than 2 tickers — proving the regression fixture is exercising the right path.
+        """
+        import json as _json
+        import re
+
+        _TICKER_RE = re.compile(r"\b[A-Z]{2,5}\b")
+        _TICKER_EXCLUDE = frozenset({
+            "THE", "AND", "FOR", "NOT", "BUT", "NOR", "YET", "SO", "OR",
+            "WITH", "FROM", "THAT", "THIS", "PASS", "FAIL",
+            "FCF", "RSI", "TAM", "CPI", "PCE", "FED", "SEC", "ETF",
+            "CEO", "CFO", "COO", "IPO", "GDP", "EPS", "ROE", "ROA",
+            "FRED", "ISM", "VIX", "YTD", "YOY", "TTM",
+            "MACD", "ROIC", "ARR", "AUM",
+            "REIT", "SPAC", "AI", "ML", "US", "UK", "EU", "USD",
+            "GPU", "FSD", "AWS", "PBM",
+        })
+
+        raw = _make_persona_output_sparse_opening("value")
+        report_text = _json.loads(raw)["report"]
+        # Extract first paragraph (up to first blank line or 500 chars — mirrors
+        # _extract_summary behaviour).
+        first_para = report_text[:500].split("\n\n")[0]
+
+        tickers_in_summary = {
+            tok for tok in _TICKER_RE.findall(first_para)
+            if tok not in _TICKER_EXCLUDE
+        }
+        assert len(tickers_in_summary) < 2, (
+            f"Fixture first paragraph contains {len(tickers_in_summary)} tickers "
+            f"({tickers_in_summary}) — it should contain <2 to reproduce the bug. "
+            "Adjust _make_persona_output_sparse_opening."
+        )
