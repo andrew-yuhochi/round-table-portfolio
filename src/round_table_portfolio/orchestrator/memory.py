@@ -1,12 +1,12 @@
-"""Component 18 — per-persona memory write-back (`state/memory/<persona>.md`).
+"""Component 18 / 18b — per-persona memory write-back (`state/memory/<persona>.md`).
 
 Appends this week's entries to the four sections of each persona's memory file:
   1. Past-calls log       — this week's Round-1 stance summary + (future) alpha outcome
   2. Counterfactual log   — this week's counterfactual portfolio snapshot
   3. Debate-stances log   — this week's Round-1 narrative summary
-  4. What's-new digest    — fresh summary of this week's research highlights
+  4. What's-new digest    — Component 28 resolved-outcomes digest (M4); report summary (M2)
 
-Design contracts:
+Design contracts (M2, unchanged by M4):
   - Write-back happens AFTER the ledger transaction commits.  The orchestrator
     (weekly_run.py) is the sole caller; it calls writeback_memory as the last
     step after conn.commit() — never before.  A rolled-back week leaves memory
@@ -17,6 +17,21 @@ Design contracts:
     is moved to state/memory/archive/<persona>.md (appended there) before the
     new entry is added.  Entries are never dropped.
   - If a persona's memory file is absent, it is created on first write.
+  - Sole-writer: only writeback_memory writes memory files; readers are
+    read-only.
+
+M4 extension (Component 18b):
+  - Resolved-alpha backfill: for each (week, persona) in ``resolved_alpha``,
+    the past-calls ``### Entry <week>`` for that persona has its
+    ``outcome: pending`` line replaced in-place with
+    ``outcome: alpha=<value> resolved=<this_week>``.  This is an UPDATE of a
+    prior entry, never a new append.  If the entry has overflowed to the archive
+    the archive copy is updated instead.  If neither is found a Minor warning is
+    logged and backfill is skipped — no phantom entry is ever fabricated.
+  - Digest source: the what's-new digest entry is now sourced from Component
+    28's ``build_whats_new_digest`` text (a per-persona map passed via
+    ``whats_new_digests``).  Falls back to the M2 report-summary path when the
+    map is absent or has no entry for the persona.
 
 Round-trip contract:
   The section format written here is the canonical format for both writing and
@@ -225,6 +240,149 @@ def _append_to_archive(
 
 
 # ---------------------------------------------------------------------------
+# Resolved-alpha in-place backfill helpers (M4 / Component 18b)
+# ---------------------------------------------------------------------------
+
+_OUTCOME_PENDING = "outcome: pending"
+
+
+def _outcome_resolved_line(alpha: float, resolved_week: str) -> str:
+    """Render the resolved outcome line for a backfilled past-calls entry."""
+    return f"outcome: alpha={alpha:+.4f} resolved={resolved_week}"
+
+
+def _backfill_outcome_in_body(body: str, alpha: float, resolved_week: str) -> str:
+    """Replace the ``outcome: pending`` line in *body* with the resolved value.
+
+    Returns the modified body.  If the body does not contain ``outcome: pending``
+    (already resolved or unusual format), returns it unchanged.
+    """
+    resolved_line = _outcome_resolved_line(alpha, resolved_week)
+    return body.replace(_OUTCOME_PENDING, resolved_line, 1)
+
+
+def _backfill_in_parsed(
+    parsed: ParsedMemoryFile,
+    persona: str,
+    call_week: str,
+    alpha: float,
+    resolved_week: str,
+) -> bool:
+    """Update the ``outcome:`` line of the past-calls entry for *call_week* in place.
+
+    Operates on the in-memory ``ParsedMemoryFile``.  Returns True when the
+    entry was found and updated, False when not present (overflowed to archive
+    or genuinely absent).
+
+    Never creates a new entry — this is an in-place update only.
+    """
+    section = parsed.sections.get(SECTION_PAST_CALLS)
+    if section is None:
+        return False
+    for idx, (week_id, body) in enumerate(section.entries):
+        if week_id == call_week:
+            new_body = _backfill_outcome_in_body(body, alpha, resolved_week)
+            section.entries[idx] = (week_id, new_body)
+            logger.debug(
+                "Backfilled outcome in live file: persona=%s week=%s alpha=%+.4f",
+                persona, call_week, alpha,
+            )
+            return True
+    return False
+
+
+def _backfill_in_archive(
+    archive_path: Path,
+    persona: str,
+    call_week: str,
+    alpha: float,
+    resolved_week: str,
+) -> bool:
+    """Update the ``outcome:`` line of *call_week*'s entry in the archive file.
+
+    Reads the archive file, replaces the first ``outcome: pending`` that appears
+    inside the ``### Entry <call_week>`` block, then rewrites the file atomically.
+    Returns True when the entry was found and the file updated, False when not
+    present.
+
+    The archive is append-only from the cap-overflow path; this function applies
+    a targeted line replacement inside the relevant block without altering any
+    other content.
+    """
+    if not archive_path.exists():
+        return False
+
+    text = archive_path.read_text(encoding="utf-8")
+    entry_header = f"{_ENTRY_PREFIX}{call_week}\n"
+    start = text.find(entry_header)
+    if start == -1:
+        return False
+
+    # Find the end of this entry's block: next "### Entry" or end of file.
+    body_start = start + len(entry_header)
+    next_entry = text.find(_ENTRY_PREFIX, body_start)
+    block_end = next_entry if next_entry != -1 else len(text)
+
+    block = text[body_start:block_end]
+    if _OUTCOME_PENDING not in block:
+        # Already resolved or no outcome line — nothing to do.
+        return False
+
+    resolved_line = _outcome_resolved_line(alpha, resolved_week)
+    new_block = block.replace(_OUTCOME_PENDING, resolved_line, 1)
+    new_text = text[:body_start] + new_block + text[block_end:]
+
+    _write_atomically(archive_path, new_text)
+    logger.debug(
+        "Backfilled outcome in archive: persona=%s week=%s alpha=%+.4f path=%s",
+        persona, call_week, alpha, archive_path,
+    )
+    return True
+
+
+def _apply_resolved_alpha_backfill(
+    parsed: ParsedMemoryFile,
+    persona: str,
+    resolved_week: str,
+    resolved_alpha: dict[str, object],
+    archive_dir: Path,
+) -> None:
+    """Apply all resolved-alpha backfills for *persona* from *resolved_alpha*.
+
+    ``resolved_alpha`` shape: ``{week_id: {persona_slug: alpha_value}}``.
+
+    For each (call_week, alpha) where this persona appears:
+      1. Try to update the entry in the live parsed file (in-memory).
+      2. If not found there (overflowed to archive), try the archive file.
+      3. If still not found, log a Minor warning and skip — no phantom entry.
+    """
+    for call_week, per_persona in resolved_alpha.items():  # type: ignore[union-attr]
+        if not isinstance(per_persona, dict):
+            continue
+        alpha_val = per_persona.get(persona)
+        if alpha_val is None:
+            continue
+        alpha = float(alpha_val)
+
+        found_in_live = _backfill_in_parsed(
+            parsed, persona, call_week, alpha, resolved_week
+        )
+        if found_in_live:
+            continue
+
+        archive_path = archive_dir / f"{persona}.md"
+        found_in_archive = _backfill_in_archive(
+            archive_path, persona, call_week, alpha, resolved_week
+        )
+        if not found_in_archive:
+            logger.warning(
+                "resolved_alpha backfill skipped — entry not found in live file "
+                "or archive (phantom-guard): persona=%s call_week=%s alpha=%+.4f",
+                persona, call_week, alpha,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Cap enforcer
 # ---------------------------------------------------------------------------
 
@@ -354,8 +512,23 @@ def _build_whats_new_entry(
     persona: str,
     week_id: str,
     validated_reports: list[object],
+    whats_new_digests: dict[str, str] | None = None,
 ) -> str:
-    """Build the what's-new digest entry from the persona's validated report summary."""
+    """Build the what's-new digest entry.
+
+    M4 path (preferred): when *whats_new_digests* contains an entry for
+    *persona*, that Component 28 text is used verbatim as the digest body.
+
+    M2 fallback: when *whats_new_digests* is absent or has no entry for
+    *persona*, the report summary is used (preserves M2 behaviour).
+    """
+    # M4 path — Component 28 digest text.
+    if whats_new_digests is not None:
+        digest_text = whats_new_digests.get(persona)
+        if digest_text is not None:
+            return f"week: {week_id}\ndigest: {digest_text}"
+
+    # M2 fallback — report summary.
     from round_table_portfolio.research.runner import PersonaResearchResult
     for res in validated_reports:
         r: PersonaResearchResult = res  # type: ignore[assignment]
@@ -380,6 +553,7 @@ def writeback_memory(
     validated_reports: list[object],
     resolved_alpha: dict[str, object],
     *,
+    whats_new_digests: dict[str, str] | None = None,
     memory_dir: Path = Path("state/memory"),
     archive_dir: Path = Path("state/memory/archive"),
     cap: int = _DEFAULT_CAP,
@@ -390,7 +564,18 @@ def writeback_memory(
       1. Past-calls log       — Round-1 stances + pending outcome field
       2. Counterfactual log   — counterfactual portfolio snapshot
       3. Debate-stances log   — Round-1 narrative summary
-      4. What's-new digest    — research summary + validator verdict
+      4. What's-new digest    — Component 28 digest (M4) or report summary (M2)
+
+    M4 extensions (Component 18b):
+      - Resolved-alpha backfill: entries in ``resolved_alpha`` (shape
+        ``{week_id: {persona: alpha_value}}``) are applied IN PLACE to prior
+        past-calls entries, replacing ``outcome: pending`` with the resolved
+        value.  Live-file entries are updated before the new week is appended;
+        archived entries are updated in the archive file.  No phantom entries
+        are ever created.
+      - Digest source: when ``whats_new_digests`` carries an entry for a
+        persona, that Component 28 text is written as the digest body instead
+        of the report summary.
 
     Enforces a ``cap``-entry-per-section limit.  When a section reaches
     ``cap``, the oldest entry is archived to ``archive_dir/<persona>.md``
@@ -410,9 +595,14 @@ def writeback_memory(
                            ``{persona: {ticker: weight, 'CASH': weight}}``.
         validated_reports: List of ``PersonaResearchResult`` from this week's
                            per-persona research phase.
-        resolved_alpha:    Dict of any newly-resolved alpha outcomes whose
-                           look-forward window closed this week.  May be empty
-                           at PoC (no resolved weeks yet on first run).
+        resolved_alpha:    Map of newly-resolved alpha outcomes whose
+                           look-forward window closed this week, shape
+                           ``{week_id: {persona: alpha_value}}``.  May be
+                           empty (``{}``) at M2/M3; populated at M4+.
+        whats_new_digests: Optional per-persona Component 28 digest texts,
+                           shape ``{persona: digest_text}``.  When provided,
+                           these replace the M2 report-summary source for the
+                           what's-new digest section.
         memory_dir:        Root of the memory files (default ``state/memory/``).
         archive_dir:       Root of the archive files (default
                            ``state/memory/archive/``).
@@ -450,6 +640,7 @@ def writeback_memory(
         )
 
     memory_dir.mkdir(parents=True, exist_ok=True)
+    archive_dir.mkdir(parents=True, exist_ok=True)
 
     for persona in persona_slugs:
         memory_path = memory_dir / f"{persona}.md"
@@ -457,11 +648,22 @@ def writeback_memory(
         # Load (or create) the existing memory file.
         parsed = parse_memory_file(memory_path)
 
+        # M4: backfill any resolved outcomes onto prior past-calls entries
+        # BEFORE appending this week's new entry.  This updates the parsed
+        # in-memory structure for live-file entries; archive entries are
+        # updated directly on disk inside _apply_resolved_alpha_backfill.
+        if resolved_alpha:
+            _apply_resolved_alpha_backfill(
+                parsed, persona, week_id, resolved_alpha, archive_dir
+            )
+
         # Build the four new entries for this week.
         past_calls_entry = _build_past_calls_entry(persona, week_id, capture)
         counterfactual_entry = _build_counterfactual_entry(persona, week_id, counterfactuals)
         debate_stances_entry = _build_debate_stances_entry(persona, week_id, capture)
-        whats_new_entry = _build_whats_new_entry(persona, week_id, validated_reports)
+        whats_new_entry = _build_whats_new_entry(
+            persona, week_id, validated_reports, whats_new_digests
+        )
 
         # Append to each section, enforcing the cap.
         for section_name, entry_body in [
