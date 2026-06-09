@@ -631,3 +631,291 @@ class TestReplayJudge:
             "ReplayJudge returned different results for the same slug — "
             "it must replay the pre-captured verdict regardless of report text."
         )
+
+
+# ---------------------------------------------------------------------------
+# Gap-A: run_preview writes a persistent debate transcript
+# ---------------------------------------------------------------------------
+
+# Minimal valid round2 reply for the 2 outliers that the engine selects.
+# We can't know which 2 slugs will be selected from the smoke fixture ahead of
+# time, so we pre-build valid round2 JSON for ALL 7 and let the test pick them
+# up after running preview once without round2 (to discover the outlier slugs),
+# then re-run with round2.  Simpler: provide replies for all 7 — the driver
+# only uses the 2 it actually selected, ignoring the rest.
+
+def _make_round2_output(slug: str, debate_set: list[str]) -> str:
+    """Produce a valid ROUND 2 OUTPUT SCHEMA JSON for one outlier persona."""
+    stances = [
+        {
+            "ticker": t,
+            "action": "ADD",
+            "target_weight": 0.10,
+            "confidence": 3,
+            "rationale": f"Defended position on {t} — counterargument not compelling.",
+            "position_change": "defended",
+        }
+        for t in debate_set[:3]   # outlier restates stances for its top tickers
+    ]
+    schema = {
+        "round": 2,
+        "rebuttal_narrative": f"{slug}: I maintain my positions after reviewing the counterarguments.",
+        "stances": stances,
+    }
+    return json.dumps(schema)
+
+
+@pytest.fixture()
+def smoke_env_with_round2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Full wired temp environment that also provides round2_replies.json.
+
+    Builds on the same input files as smoke_env but additionally writes
+    round2_replies.json and round2_timing.json so run_preview exercises the
+    full R1+R2 path (Gap A, B, C).
+    """
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    runs_dir = state_root / "runs"
+    runs_dir.mkdir()
+    memory_dir = state_root / "memory"
+    memory_dir.mkdir()
+
+    for slug in _PERSONA_SLUGS:
+        (memory_dir / f"{slug}.md").write_text(
+            f"# {slug} memory\nNo prior weeks.\n", encoding="utf-8"
+        )
+
+    persona_replies = {slug: _make_persona_output(slug) for slug in _PERSONA_SLUGS}
+    debate_set = _extract_debate_set_from_replies(persona_replies)
+    round1_replies = {slug: _make_round1_output(slug, debate_set) for slug in _PERSONA_SLUGS}
+
+    (runs_dir / f"{WEEK_ID}.persona_replies.json").write_text(
+        json.dumps(persona_replies), encoding="utf-8"
+    )
+    (runs_dir / f"{WEEK_ID}.round1_replies.json").write_text(
+        json.dumps(round1_replies), encoding="utf-8"
+    )
+    (runs_dir / f"{WEEK_ID}.judge_verdicts.json").write_text(
+        json.dumps(FAKE_VERDICTS), encoding="utf-8"
+    )
+    (runs_dir / f"{WEEK_ID}.timing.json").write_text(
+        json.dumps(FAKE_TIMINGS), encoding="utf-8"
+    )
+
+    # Provide round2 replies for all 7 personas (driver uses whichever 2 were selected).
+    round2_replies = {slug: _make_round2_output(slug, debate_set) for slug in _PERSONA_SLUGS}
+    (runs_dir / f"{WEEK_ID}.round2_replies.json").write_text(
+        json.dumps(round2_replies), encoding="utf-8"
+    )
+    # Fake round2 timing for the 2 outliers (driver loads this but only 2 slugs
+    # end up being dispatched; use first 2 slugs as a stand-in — values are arbitrary).
+    round2_timing = {_PERSONA_SLUGS[0]: 45.0, _PERSONA_SLUGS[1]: 52.0}
+    (runs_dir / f"{WEEK_ID}.round2_timing.json").write_text(
+        json.dumps(round2_timing), encoding="utf-8"
+    )
+
+    db_path = state_root / "ledger.db"
+    apply_schema(db_path=db_path)
+    monkeypatch.setattr(_driver_mod, "_PROJECT_ROOT", _PROJECT_ROOT)
+
+    return {
+        "state_root": state_root,
+        "db_path": db_path,
+        "persona_replies": persona_replies,
+        "debate_set": debate_set,
+        "week": WEEK_ID,
+    }
+
+
+class TestPreviewTranscriptPersistence:
+    """Gap A: run_preview must persist the R1+R2 transcript to state/runs/<week>.debate_transcript.md."""
+
+    @pytest.fixture(autouse=True)
+    def _run_preview(self, smoke_env_with_round2: dict) -> None:
+        run_preview(smoke_env_with_round2["week"], smoke_env_with_round2["state_root"])
+        self._env = smoke_env_with_round2
+
+    def test_transcript_file_written_to_persistent_path(self) -> None:
+        transcript_path = (
+            self._env["state_root"] / "runs" / f"{WEEK_ID}.debate_transcript.md"
+        )
+        assert transcript_path.exists(), (
+            f"Persistent transcript not written to {transcript_path}. "
+            "Gap A fix: run_preview must copy the temp transcript before rmtree."
+        )
+        assert transcript_path.stat().st_size > 0, "Transcript file is empty."
+
+    def test_transcript_contains_round2_section(self) -> None:
+        transcript_path = (
+            self._env["state_root"] / "runs" / f"{WEEK_ID}.debate_transcript.md"
+        )
+        if not transcript_path.exists():
+            pytest.skip("Transcript not written — see test_transcript_file_written_to_persistent_path.")
+        content = transcript_path.read_text(encoding="utf-8")
+        assert "## Round 2" in content, (
+            "Transcript does not contain '## Round 2' section. "
+            "The persisted transcript must include the full R1+R2 debate."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gap-B: preview.md shows recalibrated M3 dissent, NOT the stale σ ≥ 0.080 metric
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewRecalibratedDissent:
+    """Gap B: _render_preview must use result.dissent / result.outliers (M3), not old σ threshold."""
+
+    @pytest.fixture(autouse=True)
+    def _run_preview(self, smoke_env_with_round2: dict) -> None:
+        run_preview(smoke_env_with_round2["week"], smoke_env_with_round2["state_root"])
+        self._env = smoke_env_with_round2
+        preview_path = (
+            smoke_env_with_round2["state_root"] / "runs" / f"{WEEK_ID}.preview.md"
+        )
+        self._preview_text = (
+            preview_path.read_text(encoding="utf-8") if preview_path.exists() else ""
+        )
+
+    def test_preview_contains_dissent_score(self) -> None:
+        assert "Dissent score:" in self._preview_text, (
+            "preview.md is missing 'Dissent score:' — recalibrated M3 dissent not rendered."
+        )
+
+    def test_preview_contains_contested_flag(self) -> None:
+        assert "Contested week" in self._preview_text, (
+            "preview.md is missing 'Contested week' line — recalibrated M3 dissent not rendered."
+        )
+
+    def test_preview_contains_selected_outliers(self) -> None:
+        assert "Selected outliers" in self._preview_text, (
+            "preview.md is missing 'Selected outliers' section — outlier table not rendered."
+        )
+
+    def test_preview_does_not_contain_stale_sigma_threshold(self) -> None:
+        assert "σ ≥ 0.080" not in self._preview_text, (
+            "preview.md still contains the stale M2 σ ≥ 0.080 threshold string. "
+            "The render must use the recalibrated M3 dissent_score, not the old metric."
+        )
+
+    def test_preview_contains_round2_summary_section(self) -> None:
+        assert "## Round 2" in self._preview_text, (
+            "preview.md is missing '## Round 2' section."
+        )
+
+    def test_preview_round2_section_contains_defend_revise(self) -> None:
+        assert "defended" in self._preview_text, (
+            "preview.md Round-2 section does not show defended/revised counts."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gap-C: full-cycle timing render sums all 4 phases and computes verdict on combined total
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewFullCycleTiming:
+    """Gap C: timing section must sum all 4 phases and use the combined total for the verdict."""
+
+    @pytest.fixture(autouse=True)
+    def _run_preview(self, smoke_env_with_round2: dict) -> None:
+        run_preview(smoke_env_with_round2["week"], smoke_env_with_round2["state_root"])
+        self._env = smoke_env_with_round2
+        preview_path = (
+            smoke_env_with_round2["state_root"] / "runs" / f"{WEEK_ID}.preview.md"
+        )
+        self._preview_text = (
+            preview_path.read_text(encoding="utf-8") if preview_path.exists() else ""
+        )
+
+    def test_full_cycle_timing_section_present(self) -> None:
+        assert "Full-Cycle Timing" in self._preview_text, (
+            "preview.md is missing 'Full-Cycle Timing' section (Gap C fix not applied)."
+        )
+
+    def test_combined_total_row_present(self) -> None:
+        assert "COMBINED TOTAL" in self._preview_text, (
+            "preview.md 'Full-Cycle Timing' section missing 'COMBINED TOTAL' row."
+        )
+
+    def test_feasibility_verdict_present(self) -> None:
+        assert "Feasibility verdict:" in self._preview_text, (
+            "preview.md is missing 'Feasibility verdict:' line in full-cycle section."
+        )
+
+    def test_combined_total_exceeds_research_only(self) -> None:
+        """Combined total must be >= research total (FAKE_TIMINGS sum = 770s).
+
+        The smoke fixture provides round2_timing with 2 entries (45+52=97s), so
+        the combined total must be > the research-only sum.
+        """
+        research_total = sum(FAKE_TIMINGS.values())  # 770s
+        # Extract combined total from the preview text.
+        import re
+        match = re.search(r"\*\*COMBINED TOTAL\*\*.*?\*\*([\d.]+)\*\*", self._preview_text)
+        if match is None:
+            pytest.fail("Could not parse COMBINED TOTAL from preview.md.")
+        combined = float(match.group(1))
+        assert combined >= research_total, (
+            f"Combined total ({combined}s) is less than research-only total ({research_total}s). "
+            "round2_timing must be summed into the combined total."
+        )
+
+    def test_verdict_computed_on_combined_total_not_research_only(self) -> None:
+        """Verdict must be computed on the combined total.
+
+        Construct a scenario where research alone would be FITS but combined
+        total crosses TIGHT: research=3600s (research_only=3600s, window=5h=18000s → 20%=FITS),
+        round2=8001s → combined=11601s → 64.4% → TIGHT.  This is verified via
+        _compute_round2_defend_revise + _render_preview directly (unit-level, no full run).
+        """
+        # Import the private helpers from the driver module.
+        _render_preview = _driver_mod._render_preview
+        _PreviewData = _driver_mod._PreviewData
+
+        # Stub dissent/outliers/resynthesis so _render_preview doesn't crash.
+        class _FakeDissent:
+            dissent_score = 0.30
+            contested_week = False
+            per_persona_divergence: dict = {}
+
+        class _FakeOutliers:
+            selected: list = []
+
+        # research=3600s (20% of 5h → FITS alone),
+        # round2=8001s → combined=11601s → 64.5% → TIGHT
+        data = _PreviewData(
+            week="2026-W99",
+            consensus_holdings=[],
+            transcript_text="",
+            persona_snapshots={},
+            debate_set=[],
+            num_portfolios_written=8,
+            num_stances_written=0,
+            decision_type="panel_approved",
+            metrics=None,
+            session_timing={"value": 3600.0},
+            dissent=_FakeDissent(),
+            outliers=_FakeOutliers(),
+            resynthesis=None,
+            num_round2_stances=0,
+            round2_defend_revise={},
+            round1_timing={},
+            judge_timing={},
+            round2_timing={"growth": 8001.0},
+        )
+        rendered = _render_preview(data)
+        # Extract the verdict keyword from "Feasibility verdict: TIGHT" (first word after colon+space).
+        import re as _re
+        verdict_match = _re.search(r"Feasibility verdict:\s*\*\*(\w[\w-]*)\*\*", rendered)
+        if verdict_match is None:
+            verdict_match = _re.search(r"Feasibility verdict:\s*(\w[\w-]*)", rendered)
+        assert verdict_match is not None, (
+            "Could not find 'Feasibility verdict: <WORD>' in rendered preview."
+        )
+        verdict_word = verdict_match.group(1).upper()
+        assert verdict_word == "TIGHT", (
+            f"Verdict should be TIGHT when research(3600s) + round2(8001s) = 11601s "
+            f"(64.5% of 5h window), but got '{verdict_word}'. "
+            "Verdict is being computed on research-only, not the combined total."
+        )

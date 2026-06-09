@@ -501,6 +501,38 @@ class _PreviewData(NamedTuple):
     metrics: Any
     # Real session timing (from state/runs/<week>.timing.json).
     session_timing: dict
+    # M3 dissent / outlier / resynthesis (from WeeklyRunResult — used by Gap-B render).
+    dissent: Any          # DissentResult — .dissent_score, .contested_week, .per_persona_divergence
+    outliers: Any         # OutlierSelection — .selected (list[str])
+    resynthesis: Any      # ResynthesisResult — .delta, .outlier_personas; None when R2 skipped
+    num_round2_stances: int
+    # Per-outlier defend/revise counts: {slug: {"defended": int, "revised": int}}.
+    round2_defend_revise: dict
+    # Per-phase timing maps for Gap-C full-cycle render.
+    round1_timing: dict   # {} when absent
+    judge_timing: dict    # {} when absent
+    round2_timing: dict   # {} when absent
+
+
+def _compute_round2_defend_revise(
+    round2_replies_raw: dict[str, str],
+    week: str = "unknown",
+) -> dict[str, dict[str, int]]:
+    """Parse round2_replies_raw and count defended/revised stances per outlier.
+
+    Returns {slug: {"defended": N, "revised": N}}.  Silently skips unparseable
+    replies (parse failure → 0/0 for that slug).
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for slug, raw in round2_replies_raw.items():
+        try:
+            reply = parse_round2_reply(raw, persona_slug=slug, week_id=week)
+            defended = sum(1 for s in reply.stances if s.position_change == "defended")
+            revised = sum(1 for s in reply.stances if s.position_change == "revised")
+            counts[slug] = {"defended": defended, "revised": revised}
+        except Exception:
+            counts[slug] = {"defended": 0, "revised": 0}
+    return counts
 
 
 def _read_preview_data_from_temp(
@@ -508,6 +540,10 @@ def _read_preview_data_from_temp(
     tmp_db: Path,
     week: str,
     session_timing: dict[str, float],
+    round1_timing: dict[str, float],
+    judge_timing: dict[str, float],
+    round2_timing: dict[str, float],
+    round2_defend_revise: dict[str, dict[str, int]],
 ) -> _PreviewData:
     """Extract all preview-render data from the temp DB and transcript file.
 
@@ -574,6 +610,14 @@ def _read_preview_data_from_temp(
         decision_type=result.decision_type,
         metrics=result.metrics,
         session_timing=session_timing,
+        dissent=result.dissent,
+        outliers=result.outliers,
+        resynthesis=result.resynthesis,
+        num_round2_stances=result.num_round2_stances,
+        round2_defend_revise=round2_defend_revise,
+        round1_timing=round1_timing,
+        judge_timing=judge_timing,
+        round2_timing=round2_timing,
     )
 
 
@@ -606,27 +650,54 @@ def _render_preview(data: _PreviewData) -> str:
     else:
         lines += ["_All personas EXIT — 100% CASH._", ""]
 
-    # --- Round-1 dissent / key contention (from transcript) ---
+    # --- Round-1 Dissent (recalibrated M3 — from WeeklyRunResult.dissent/outliers) ---
     lines += ["## Round-1 Dissent", ""]
-    if data.transcript_text:
-        # Extract the Dissent Note section from the transcript markdown.
-        in_dissent = False
-        dissent_lines: list[str] = []
-        for line in data.transcript_text.splitlines():
-            if line.startswith("### Dissent Note"):
-                in_dissent = True
-                continue
-            if in_dissent:
-                # Stop at the next ### or ## heading.
-                if line.startswith("##"):
-                    break
-                dissent_lines.append(line)
-        if dissent_lines:
-            lines += dissent_lines + [""]
-        else:
-            lines += ["*(no dissent data in transcript)*", ""]
+    if data.dissent is not None:
+        d = data.dissent
+        contested_label = "YES" if d.contested_week else "no"
+        lines += [
+            f"- **Dissent score:** {d.dissent_score:.4f}",
+            f"- **Contested week** (threshold 0.50): {contested_label}",
+        ]
+        if data.outliers is not None and data.outliers.selected:
+            lines += ["", "**Selected outliers (most divergent):**", ""]
+            lines += ["| Persona | Divergence |", "|---------|------------|"]
+            for slug in data.outliers.selected:
+                div = d.per_persona_divergence.get(slug, 0.0)
+                lines.append(f"| {slug} | {div:.4f} |")
+        lines += [""]
     else:
-        lines += ["*(transcript not available)*", ""]
+        lines += ["*(dissent data not available)*", ""]
+
+    # --- Round 2 summary ---
+    lines += ["## Round 2", ""]
+    if data.num_round2_stances > 0 and data.outliers is not None and data.resynthesis is not None:
+        outlier_slugs = data.outliers.selected
+        for slug in outlier_slugs:
+            dr = data.round2_defend_revise.get(slug, {})
+            defended = dr.get("defended", 0)
+            revised = dr.get("revised", 0)
+            lines.append(f"- **{slug}**: {defended} defended, {revised} revised")
+        # Consensus shift summary.
+        if data.resynthesis.delta:
+            moved = sorted(
+                data.resynthesis.delta.items(), key=lambda x: -abs(x[1])
+            )
+            moved_str = ", ".join(f"{t} ({w:+.4f})" for t, w in moved[:5])
+            lines += ["", f"**Consensus shift:** {moved_str}"]
+        else:
+            lines += ["", "**Consensus shift:** no movement — all outliers defended"]
+        lines += [
+            "",
+            f"*Full R1+R2 debate detail (counterarguments + rebuttal narratives) → "
+            f"`state/runs/{week}.debate_transcript.md`*",
+            "",
+        ]
+    else:
+        lines += [
+            "*(Round-2 data not available — no round2_replies.json provided)*",
+            "",
+        ]
 
     # --- Per-persona counterfactual snapshot ---
     lines += ["## Per-Persona Snapshot", ""]
@@ -663,30 +734,59 @@ def _render_preview(data: _PreviewData) -> str:
     if data.metrics:
         lines += ["## Run Metrics", "", data.metrics.summary_text, ""]
 
-    # --- Real session timing ---
+    # --- Full-cycle timing (DEF-003: research + R1 + judges + R2) ---
     if data.session_timing:
-        total_session_secs = sum(data.session_timing.values())
-        window_hours = 5.0
-        pct_window = (total_session_secs / (window_hours * 3600)) * 100
+        import yaml as _yaml
+        _ws_cfg_path = _PROJECT_ROOT / "config" / "web_search.yaml"
+        _ws_cfg = _yaml.safe_load(_ws_cfg_path.read_text(encoding="utf-8")) if _ws_cfg_path.exists() else {}
+        window_hours: float = float(_ws_cfg.get("window_hours", 5.0))
+        proximity_threshold: float = float(_ws_cfg.get("window_proximity_threshold", 0.80))
+
+        research_total = sum(data.session_timing.values())
+        r1_total = sum(data.round1_timing.values()) if data.round1_timing else 0.0
+        judge_total = sum(data.judge_timing.values()) if data.judge_timing else 0.0
+        r2_total = sum(data.round2_timing.values()) if data.round2_timing else 0.0
+        combined_total = research_total + r1_total + judge_total + r2_total
+
+        window_secs = window_hours * 3600.0
+        window_frac = combined_total / window_secs if window_secs > 0 else 0.0
+        window_pct = window_frac * 100.0
+
+        # Reuse the same verdict bands as report_run_metrics (TIGHT_BAND_START=0.60).
+        _TIGHT_START = 0.60
+        if window_frac >= proximity_threshold:
+            verdict = "DOES-NOT-FIT"
+        elif window_frac >= _TIGHT_START:
+            verdict = "TIGHT"
+        else:
+            verdict = "FITS"
+
         lines += [
-            "## Research Wall-Clock Timing (real — measured by session)",
+            "## Full-Cycle Timing (real — measured by session)",
             "",
-            f"| Persona | Wall-clock (s) |",
-            "|---------|----------------|",
+            "| Phase | Wall-clock (s) | Notes |",
+            "|-------|---------------|-------|",
+            f"| Research (7 personas) | {research_total:.1f} | from timing.json |",
+            f"| Round-1 dispatch | {r1_total:.1f} | "
+            + ("from round1_timing.json" if data.round1_timing else "absent — treated as 0") + " |",
+            f"| Judge dispatch | {judge_total:.1f} | "
+            + ("from judge_timing.json" if data.judge_timing else "absent — treated as 0") + " |",
+            f"| Round-2 dispatch | {r2_total:.1f} | "
+            + ("from round2_timing.json" if data.round2_timing else "absent — treated as 0") + " |",
+            f"| **COMBINED TOTAL** | **{combined_total:.1f}** | |",
+            "",
+            f"*Combined total: {combined_total:.0f}s "
+            f"({combined_total/60:.1f} min) — "
+            f"{window_pct:.1f}% of the {window_hours:.0f}-hour weekly window.*",
+            "",
+            f"**Feasibility verdict: {verdict}** "
+            f"(FITS < 60% ≤ TIGHT < {proximity_threshold*100:.0f}% ≤ DOES-NOT-FIT)",
+            "",
+            "> Per-phase research breakdown (7 personas):",
         ]
         for slug, secs in data.session_timing.items():
-            lines.append(f"| {slug} | {secs:.1f} |")
-        lines += [
-            f"| **TOTAL** | **{total_session_secs:.1f}** |",
-            "",
-            f"*Total: {total_session_secs:.0f}s "
-            f"({total_session_secs/60:.1f} min) — "
-            f"{pct_window:.1f}% of the {window_hours:.0f}-hour weekly window.*",
-            "",
-            "> Engine-internal timing (near-zero) is excluded; the figures above "
-            "are the real research wall-clock the session measured.",
-            "",
-        ]
+            lines.append(f"> - {slug}: {secs:.1f}s")
+        lines += [""]
 
     lines += [
         "---",
@@ -792,9 +892,27 @@ def run_preview(week: str, state_root: Path) -> None:
             db_path=tmp_db,
         )
 
+        # Gap A: copy the R1+R2 debate transcript to a persistent path BEFORE cleanup.
+        # The transcript lives in tmp_state/debates/<week>.md (written by
+        # write_round1_transcript + append_round2_transcript).
+        persistent_transcript: Optional[Path] = None
+        tmp_transcript = result.transcript_path  # Path inside the temp dir
+        if tmp_transcript is not None and tmp_transcript.exists():
+            persistent_dir = state_root / "runs"
+            persistent_dir.mkdir(parents=True, exist_ok=True)
+            persistent_transcript = persistent_dir / f"{week}.debate_transcript.md"
+            shutil.copy2(str(tmp_transcript), str(persistent_transcript))
+
         # Capture all preview data BEFORE the temp dir is removed.
         preview_data = _read_preview_data_from_temp(
-            result, tmp_db, week, session_timing
+            result,
+            tmp_db,
+            week,
+            session_timing,
+            round1_timing,
+            judge_timing,
+            round2_timing,
+            _compute_round2_defend_revise(round2_replies_raw, week=week),
         )
     finally:
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
@@ -810,6 +928,8 @@ def run_preview(week: str, state_root: Path) -> None:
 
     print(preview_text)
     print(f"\nPreview written to: {preview_path}")
+    if persistent_transcript is not None:
+        print(f"Full R1+R2 debate transcript written to: {persistent_transcript}")
 
 
 # ---------------------------------------------------------------------------
