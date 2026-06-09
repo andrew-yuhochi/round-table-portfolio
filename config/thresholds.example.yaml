@@ -21,3 +21,9 @@ divergence_tiebreak: alpha_asc
 counterargument_max_rationales: 3
 # Signed-score epsilon: tickers/personas within this tolerance are treated as agreed.
 counterargument_agree_tolerance: 0.05
+
+# Component 28 — whats_new_digest_builder (TASK-M4-001)
+# Max resolved calls surfaced in the "what's new" digest per persona per run.
+digest_max_items: 5
+# Surface own resolved-below-SPY calls (misses) in the digest (true/false).
+own_misses_in_digest: true
