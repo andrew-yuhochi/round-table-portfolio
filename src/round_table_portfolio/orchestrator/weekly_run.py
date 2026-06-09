@@ -138,6 +138,26 @@ from round_table_portfolio.orchestrator.resynthesis import (
 # Component 18 — real implementation (TASK-M2-008).
 from round_table_portfolio.orchestrator.memory import writeback_memory
 
+# M4 Components — real implementations (TASK-M4-002/003/004/005).
+from round_table_portfolio.orchestrator.memory_reader import (
+    MemoryReaderConfig,
+    PersonaMemoryResult,
+    load_memory_reader_config,
+    read_all_personas_memory,
+)
+from round_table_portfolio.orchestrator.digest import (
+    DigestConfig,
+    ResolvedRow,
+    build_whats_new_digest,
+    load_digest_config,
+)
+from round_table_portfolio.orchestrator.briefing_builder import (
+    BriefingConfig,
+    BriefingResult,
+    build_all_briefings,
+    load_briefing_config,
+)
+
 # Component 19 — real implementation (TASK-M2-009).
 from round_table_portfolio.orchestrator.metrics import (
     RunMetricsReport,    # noqa: F401 — shape used by tests
@@ -448,6 +468,49 @@ def _vote_tally_json(stances: list[Any], debate_set: list[str]) -> str:
     return json.dumps(tally)
 
 
+def _build_resolved_alpha_for_writeback(
+    all_persona_results: dict[str, PersonaMemoryResult],
+) -> dict[str, dict[str, float]]:
+    """Bridge: reshape Component-26 resolved_rows into the {week_id: {persona: alpha}} shape.
+
+    Component 26 (`PersonaMemoryResult.resolved_rows`) returns raw `ResolvedRow` records
+    with fields `call_week_id`, `as_of_week_id`, `persona`, `ticker`, and `alpha`.
+
+    Component 18b (`writeback_memory`) consumes `resolved_alpha` shaped
+    `{call_week_id: {persona: alpha_value}}` — the outer key is the *call week* so
+    the write-back can locate the ``### Entry <call_week>`` it needs to update.
+
+    Alpha is PORTFOLIO-level (one alpha per portfolio per `as_of_week_id`), so for a
+    given `(call_week_id, persona)` any ticker's alpha from the most-recent
+    `as_of_week_id` gives the correct portfolio-level value.  When rows for the same
+    `(call_week_id, persona)` span multiple `as_of_week_id` values, the most-recent
+    one wins (latest-wins, mirroring `_resolved_alpha_map` in `memory_reader.py`).
+
+    Args:
+        all_persona_results: Output of `read_all_personas_memory` — a dict of
+            persona_slug → PersonaMemoryResult.
+
+    Returns:
+        ``{call_week_id: {persona: alpha_value}}`` — empty dict when no rows resolved.
+    """
+    # (call_week_id, persona) → (best_as_of_week_id, alpha)
+    best: dict[tuple[str, str], tuple[str, float]] = {}
+
+    for persona_result in all_persona_results.values():
+        for row in persona_result.resolved_rows:
+            key = (row.call_week_id, row.persona)
+            existing = best.get(key)
+            if existing is None or row.as_of_week_id > existing[0]:
+                best[key] = (row.as_of_week_id, row.alpha)
+
+    # Reshape to {call_week_id: {persona: alpha}}.
+    result: dict[str, dict[str, float]] = {}
+    for (call_week_id, persona), (_as_of, alpha) in best.items():
+        result.setdefault(call_week_id, {})[persona] = alpha
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # WeeklyRunResult
 # ---------------------------------------------------------------------------
@@ -476,6 +539,9 @@ class WeeklyRunResult:
     resynthesis: Any              # ResynthesisResult from resynthesis.py (Component 25)
     provisional_weights: dict     # Round-1 consensus weights (for transcript/metrics)
     persona_results: list[PersonaResearchResult] = field(default_factory=list)
+    # M4: per-persona briefing results from step-0 read-before-dispatch.
+    # Empty dict on first week (cold-start) or when memory dir has no files yet.
+    briefings: dict[str, BriefingResult] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +579,10 @@ def run_weekly(
     state_root: Optional[Path] = None,
     db_path: Optional[Path] = None,
     user_id: str = "andrew",
+    # M4 config overrides (for testing — avoid file I/O).
+    memory_reader_config: Optional[MemoryReaderConfig] = None,
+    digest_config: Optional[DigestConfig] = None,
+    briefing_config: Optional[BriefingConfig] = None,
 ) -> WeeklyRunResult:
     """Run the full single-week cycle (Round 1 + Round 2 + re-synthesis).
 
@@ -597,6 +667,81 @@ def run_weekly(
         v_config = load_validator_config(validator_config_path)
 
     _judge = judge or StubOnMandateJudge()
+
+    # ------------------------------------------------------------------
+    # 0b. M4 read-before-dispatch: read memory → build digest → render
+    #     briefings → persist 7 briefing files.
+    #
+    #     PRE-TRANSACTION and READ-ONLY (TDD §1.5 ordering invariant):
+    #     — opens its own read-only connection that closes before any write
+    #     — no BEGIN / COMMIT here; the write transaction opens at step 8
+    #     — briefing files are this-run artifacts regenerated each run
+    # ------------------------------------------------------------------
+    _m4_reader_cfg = memory_reader_config or load_memory_reader_config(thresholds_config)
+    _m4_digest_cfg = digest_config or load_digest_config(thresholds_config)
+    _m4_briefing_cfg = briefing_config or load_briefing_config(thresholds_config)
+
+    _memory_dir = _state / "memory"
+    _memory_dir.mkdir(parents=True, exist_ok=True)
+    _runs_dir = _state / "runs"
+    _runs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Open a separate read-only connection for the memory query.
+    # The ledger may not exist yet on the very first run (cold-start):
+    # read_all_personas_memory is tolerant of an empty DB (no resolved rows).
+    _read_conn = sqlite3.connect(str(_db))
+    try:
+        all_memory_results = read_all_personas_memory(
+            _read_conn,
+            personas=persona_slugs,
+            memory_dir=_memory_dir,
+            config=_m4_reader_cfg,
+        )
+    finally:
+        _read_conn.close()
+
+    # Build per-persona digest strings (Component 28).
+    _whats_new_digests: dict[str, str] = {}
+    for slug, mem_result in all_memory_results.items():
+        _whats_new_digests[slug] = build_whats_new_digest(
+            persona=slug,
+            resolved_rows=mem_result.resolved_rows,
+            past_call_entries=mem_result.windowed_memory.past_calls,
+            config=_m4_digest_cfg,
+        )
+
+    # Build and persist briefing blocks (Component 27).
+    _briefing_inputs: dict[str, Any] = {
+        slug: (
+            mem_result.windowed_memory,
+            _whats_new_digests[slug],
+            mem_result.resolved_rows,
+        )
+        for slug, mem_result in all_memory_results.items()
+    }
+    _briefings = build_all_briefings(
+        _briefing_inputs,
+        week_id=week_label,
+        config=_m4_briefing_cfg,
+        runs_dir=_runs_dir,
+        persist=True,
+    )
+    logger.info(
+        "[%s] Step-0b memory read complete: %d briefing files persisted to %s",
+        project,
+        len(_briefings),
+        _runs_dir / f"{week_label}-memory",
+    )
+
+    # Build the resolved_alpha map for the post-commit write-back (Component 18b).
+    # This is done here (pre-transaction) so the data is ready for step 9.
+    # The map is NOT passed to writeback_memory until AFTER conn.commit().
+    _resolved_alpha = _build_resolved_alpha_for_writeback(all_memory_results)
+    logger.debug(
+        "[%s] Resolved-alpha bridge: %d call-weeks with outcomes",
+        project,
+        len(_resolved_alpha),
+    )
 
     # ------------------------------------------------------------------
     # 1. Per-persona research + validation + persist claim.
@@ -923,7 +1068,8 @@ def run_weekly(
         round1,
         round1.counterfactuals,
         persona_results,
-        {},                  # resolved_alpha: empty at PoC (no closed windows yet)
+        _resolved_alpha,     # M4: populated from Component 26's resolved-outcomes query
+        whats_new_digests=_whats_new_digests,  # M4: Component 28 digest texts
         memory_dir=_state / "memory",
         archive_dir=_state / "memory" / "archive",
     )
@@ -974,4 +1120,5 @@ def run_weekly(
         resynthesis=resynth,
         provisional_weights=provisional_weights,
         persona_results=persona_results,
+        briefings=_briefings,
     )

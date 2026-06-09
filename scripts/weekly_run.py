@@ -975,11 +975,13 @@ def run_commit(week: str, founder_reply: str, state_root: Path) -> None:
         "This is a fatal invariant violation — check the ledger transaction."
     )
 
-    # Check memory and validator-claim files.
+    # Check memory, briefing, and validator-claim files.
     memory_dir = state_root / "memory"
+    briefing_dir = state_root / "runs" / f"{week}-memory"
     claims_dir = state_root / "reports" / week / "validator_claims"
 
     memory_files = [slug for slug in _PERSONA_SLUGS if (memory_dir / f"{slug}.md").exists()]
+    briefing_files = [slug for slug in _PERSONA_SLUGS if (briefing_dir / f"{slug}.md").exists()]
     claim_files = [slug for slug in _PERSONA_SLUGS if (claims_dir / f"{slug}.json").exists()]
 
     print(f"\n{'='*62}")
@@ -994,6 +996,8 @@ def run_commit(week: str, founder_reply: str, state_root: Path) -> None:
     print(f"  Persona reports:   {result.num_persona_reports}")
     print(f"  Transcript:        {result.transcript_path}")
     print(f"  Memory updates:    {len(memory_files)}/7")
+    print(f"  Briefing files:    {len(briefing_files)}/7  "
+          f"({briefing_dir})")
     print(f"  Validator claims:  {len(claim_files)}/7")
     if result.resynthesis and result.resynthesis.delta:
         moved = sorted(
