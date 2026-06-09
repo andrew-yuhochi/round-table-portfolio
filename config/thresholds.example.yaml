@@ -32,3 +32,8 @@ memory_window_weeks: 8
 digest_max_items: 5
 # Surface own resolved-below-SPY calls (misses) in the digest (true/false).
 own_misses_in_digest: true
+
+# Component 27 — memory_briefing_builder (TASK-M4-003)
+# Hard character ceiling for one persona's rendered briefing block.
+# Default 3000: leaves ≈50–60% context headroom for round-specific instruction.
+memory_briefing_max_chars: 3000
