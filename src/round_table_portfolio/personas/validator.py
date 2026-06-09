@@ -194,6 +194,28 @@ def validate_persona_definition(path: str | Path) -> PersonaValidationResult:
         if "cluster" not in ros:
             violations.append("`## RESEARCH OUTPUT SCHEMA` omits `cluster`.")
 
+    # --- ROUND 2 SCHEMA must be the NEW shape, not the stale one ----------
+    # Heading-present is checked above (REQUIRED_SECTIONS); here we enforce the
+    # section's SHAPE so a stale/old-shape block can no longer pass silently
+    # (TASK-M3-003 follow-up — the new shape is what parse_round2_reply expects).
+    r2 = sections.get("ROUND 2 OUTPUT SCHEMA", "")
+    if "ROUND 2 OUTPUT SCHEMA" in {s.upper() for s in sections}:
+        for marker in ("stances", "position_change", "rebuttal_narrative"):
+            if marker not in r2:
+                violations.append(
+                    f"`## ROUND 2 OUTPUT SCHEMA` omits `{marker}`; the Round-2 "
+                    "reply must use the new shape parsed by `parse_round2_reply` "
+                    "(Component 24)."
+                )
+        for stale in ("addresses_persona", "revised_stances"):
+            if stale in r2:
+                violations.append(
+                    f"`## ROUND 2 OUTPUT SCHEMA` still carries the old-shape field "
+                    f"`{stale}`; the Round-2 schema was migrated to "
+                    "`stances`/`position_change`/`rebuttal_narrative` "
+                    "(TASK-M3-003). Remove the stale block."
+                )
+
     ok = not violations
     if not ok:
         logger.warning("Persona %s failed validation: %d violation(s)", path.name, len(violations))

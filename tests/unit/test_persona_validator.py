@@ -103,6 +103,19 @@ _ROUND2_SCHEMA = (
     "```json\n"
     "{\n"
     '  "round": 2,\n'
+    '  "rebuttal_narrative": "<how you engaged with the counterargument>",\n'
+    '  "stances": [{"ticker": "<T>", "action": "HOLD", "target_weight": 0.0, '
+    '"confidence": 3, "rationale": "<...>", "position_change": "defended"}]\n'
+    "}\n"
+    "```"
+)
+
+# Old-shape ROUND 2 block — used only to build the deliberately-stale fixture
+# that the hardened validator (TASK-M3-003 follow-up) must REJECT.
+_ROUND2_SCHEMA_STALE = (
+    "```json\n"
+    "{\n"
+    '  "round": 2,\n'
     '  "addresses_persona": "<name>",\n'
     '  "addresses_position": "<summary>",\n'
     '  "response": "<counterargument>",\n'
@@ -283,6 +296,24 @@ def test_fixture_no_ignore_clause_fails(tmp_path: Path) -> None:
     assert any("ignore" in v.lower() for v in result.violations)
 
 
+def test_fixture_stale_round2_schema_fails(tmp_path: Path) -> None:
+    """Fixture 8 (TASK-M3-003 follow-up) — a persona that is otherwise valid but
+    carries the OLD Round-2 shape (`addresses_persona` / `revised_stances`) must be
+    REJECTED by the hardened validator, citing the round-2 shape. This is the
+    regression test that locks the schema-drift gate shut.
+    """
+    secs = dict(_BODY_SECTIONS)
+    secs["ROUND 2 OUTPUT SCHEMA"] = _ROUND2_SCHEMA_STALE
+    p = _write(tmp_path, _build_persona(sections=secs))
+    result = validate_persona_definition(p)
+    assert not result.ok
+    # Must fail citing the round-2 shape (old marker present and/or new marker absent).
+    assert any("ROUND 2 OUTPUT SCHEMA" in v for v in result.violations)
+    assert any(
+        "addresses_persona" in v or "revised_stances" in v for v in result.violations
+    )
+
+
 def test_missing_file_fails() -> None:
     result = validate_persona_definition(Path("/nonexistent/persona.md"))
     assert not result.ok
@@ -305,6 +336,7 @@ def test_fixtures_written_to_disk() -> None:
         "fail_short_in_actions.md",
         "fail_websearch_absent.md",
         "fail_missing_cash_clause.md",
+        "fail_stale_round2_schema.md",
     }
     present = {p.name for p in fdir.glob("*.md")}
     assert expected.issubset(present), f"Missing on-disk fixtures: {expected - present}"

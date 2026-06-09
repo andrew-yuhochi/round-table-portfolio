@@ -70,9 +70,7 @@ Read `state/memory/value.md` before forming this week's stance and reference pas
 ```json
 {
   "round": 2,
-  "addresses_persona": "<name>",
-  "addresses_position": "<summary>",
-  "response": "<counterargument>",
-  "revised_stances": []
+  "rebuttal_narrative": "<how you engaged with the counterargument>",
+  "stances": [{"ticker": "<T>", "action": "HOLD", "target_weight": 0.0, "confidence": 3, "rationale": "<...>", "position_change": "defended"}]
 }
 ```
