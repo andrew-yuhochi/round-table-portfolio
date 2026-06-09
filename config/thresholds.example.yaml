@@ -22,6 +22,11 @@ counterargument_max_rationales: 3
 # Signed-score epsilon: tickers/personas within this tolerance are treated as agreed.
 counterargument_agree_tolerance: 0.05
 
+# Component 26 — memory_reader (TASK-M4-002)
+# Number of most-recent memory entries per section injected into the briefing.
+# Older entries stay in the file (up to the 12-entry cap); window is for injection only.
+memory_window_weeks: 8
+
 # Component 28 — whats_new_digest_builder (TASK-M4-001)
 # Max resolved calls surfaced in the "what's new" digest per persona per run.
 digest_max_items: 5
