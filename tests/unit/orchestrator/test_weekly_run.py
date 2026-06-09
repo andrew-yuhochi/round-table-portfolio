@@ -150,6 +150,14 @@ def _make_thresholds_yaml(tmp_path: Path) -> Path:
         "max_position_weight: 0.20\n"
         "dissent_std_dev_threshold: 0.08\n"
         "run_window_hours: 5.0\n"
+        "contested_week_threshold: 0.50\n"
+        "action_direction_map:\n"
+        "  add: 1.0\n"
+        "  hold: 0.0\n"
+        "  reduce: -0.5\n"
+        "  exit: -1.0\n"
+        "n_outliers: 2\n"
+        "divergence_tiebreak: alpha_asc\n"
     )
     p = tmp_path / "thresholds.yaml"
     p.write_text(content)

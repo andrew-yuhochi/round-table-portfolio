@@ -91,6 +91,15 @@ from round_table_portfolio.portfolio.materialize import (
 # Component 17 — real implementation (TASK-M2-007).
 from round_table_portfolio.orchestrator.transcript import write_round1_transcript
 
+# Components 21 + 22 — real implementation (TASK-M3-001).
+from round_table_portfolio.orchestrator.dissent import (
+    DissentResult,    # noqa: F401 — shape used by tests
+    OutlierSelection, # noqa: F401 — shape used by tests
+    compute_dissent,
+    load_dissent_config,
+    select_outliers,
+)
+
 # Component 18 — real implementation (TASK-M2-008).
 from round_table_portfolio.orchestrator.memory import writeback_memory
 
@@ -390,34 +399,6 @@ def _write_week_transaction(
     )
 
 
-# ---------------------------------------------------------------------------
-# Std-dev helper (used for key_contention / dissent note in M2)
-# ---------------------------------------------------------------------------
-
-
-def _compute_stance_std_dev(
-    stances: list[Any],
-    debate_set: list[str],
-) -> dict[str, float]:
-    """Compute per-ticker weight std-dev across personas (population std dev).
-
-    Returns a dict of ticker → std_dev.  Used in M2 for the dissent note only;
-    M3 uses this to select divergent-persona pairs for Round 2.
-    """
-    import math
-
-    result: dict[str, float] = {}
-    for ticker in debate_set:
-        weights = [s.target_weight for s in stances if s.ticker == ticker]
-        if len(weights) < 2:
-            result[ticker] = 0.0
-            continue
-        mean = sum(weights) / len(weights)
-        variance = sum((w - mean) ** 2 for w in weights) / len(weights)
-        result[ticker] = math.sqrt(variance)
-    return result
-
-
 def _vote_tally_json(stances: list[Any], debate_set: list[str]) -> str:
     """Build the vote_tally JSON string from round-1 stances."""
     import json
@@ -430,22 +411,6 @@ def _vote_tally_json(stances: list[Any], debate_set: list[str]) -> str:
                 counts[s.action] = counts.get(s.action, 0) + 1
         tally[ticker] = counts
     return json.dumps(tally)
-
-
-def _key_contention(
-    std_devs: dict[str, float],
-    threshold: float,
-) -> str:
-    """Return a human-readable dissent note for the most contested tickers."""
-    contested = sorted(
-        ((t, v) for t, v in std_devs.items() if v >= threshold),
-        key=lambda x: -x[1],
-    )
-    if not contested:
-        return "No tickers above dissent threshold."
-    top = contested[:3]
-    parts = [f"{t} (σ={v:.3f})" for t, v in top]
-    return "Contested: " + ", ".join(parts) + ("." if len(contested) <= 3 else f" (+{len(contested)-3} more).")
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +434,8 @@ class WeeklyRunResult:
     num_persona_reports: int      # 7
     transcript_path: Optional[Path]
     metrics: Any                  # RunMetricsReport from metrics.py (Component 19)
+    dissent: Any                  # DissentResult from dissent.py (Component 21)
+    outliers: Any                 # OutlierSelection from dissent.py (Component 22)
     persona_results: list[PersonaResearchResult] = field(default_factory=list)
 
 
@@ -561,7 +528,6 @@ def run_weekly(
     budgets = load_budgets(budget_config)
     thresholds = _load_thresholds(thresholds_config)
     max_position_weight: float = float(thresholds.get("max_position_weight", 0.20))
-    dissent_threshold: float = float(thresholds.get("dissent_std_dev_threshold", 0.08))
     _ws_cfg = _load_web_search_config(web_search_config)
     window_config = {
         "window_hours": float(_ws_cfg.get("window_hours", 5.0)),
@@ -701,10 +667,18 @@ def run_weekly(
     )
 
     # ------------------------------------------------------------------
-    # 6. Compute dissent metrics for transcript.
+    # 6. Compute dissent metrics for transcript (Component 21 + 22).
     # ------------------------------------------------------------------
-    std_devs = _compute_stance_std_dev(round1.stances, debate_set)
-    key_contention = _key_contention(std_devs, dissent_threshold)
+    dissent_cfg = load_dissent_config(thresholds_config)
+    dissent_result = compute_dissent(round1.stances, debate_set, dissent_cfg)
+    outliers = select_outliers(dissent_result, round1.stances, dissent_cfg)
+    logger.info(
+        "[%s] Dissent: score=%.4f contested=%s outliers=%s",
+        project, dissent_result.dissent_score, dissent_result.contested_week,
+        outliers.selected,
+    )
+    # Per-ticker σ (new signed-score basis) feeds the transcript dissent note.
+    std_devs = dissent_result.per_ticker_sigma
     vote_tally = _vote_tally_json(round1.stances, debate_set)
 
     # ------------------------------------------------------------------
@@ -763,7 +737,11 @@ def run_weekly(
             transcript_path=transcript_path,
             transcript_summary=transcript_summary,
             transcript_vote_tally=vote_tally,
-            transcript_key_contention=key_contention,
+            transcript_key_contention=(
+                f"dissent_score={dissent_result.dissent_score:.4f} "
+                f"contested={dissent_result.contested_week} "
+                f"outliers={outliers.selected}"
+            ),
             decision_type=decision_type,
             decision_delta=decision_delta,
             user_id=user_id,
@@ -832,5 +810,7 @@ def run_weekly(
         num_persona_reports=len(persona_results),
         transcript_path=transcript_path,
         metrics=metrics,
+        dissent=dissent_result,
+        outliers=outliers,
         persona_results=persona_results,
     )

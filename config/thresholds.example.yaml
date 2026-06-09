@@ -5,3 +5,13 @@
 max_position_weight: 0.20
 dissent_std_dev_threshold: 0.08
 run_window_hours: 5.0
+
+# Component 21 — recalibrated dissent metric (DEF-004, TASK-M3-001)
+contested_week_threshold: 0.50
+action_direction_map:
+  add:    1.0
+  hold:   0.0
+  reduce: -0.5
+  exit:   -1.0
+n_outliers: 2
+divergence_tiebreak: alpha_asc
