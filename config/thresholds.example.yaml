@@ -15,3 +15,9 @@ action_direction_map:
   exit:   -1.0
 n_outliers: 2
 divergence_tiebreak: alpha_asc
+
+# Component 23 — counterargument assembly (TASK-M3-002)
+# Max opposing rationale quotes per outlier's counterargument block.
+counterargument_max_rationales: 3
+# Signed-score epsilon: tickers/personas within this tolerance are treated as agreed.
+counterargument_agree_tolerance: 0.05
