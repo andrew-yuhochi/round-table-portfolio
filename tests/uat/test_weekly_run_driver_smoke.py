@@ -493,9 +493,12 @@ class TestCommitMode:
                 "Fully-invested invariant violated."
             )
 
-    # --- Round-1-only invariant ---
+    # --- Round-1 invariant (round=2 absent when no dispatcher provided) ---
 
-    def test_no_round2_stances(self) -> None:
+    def test_no_round2_stances_without_dispatcher(self) -> None:
+        """Without round2_replies.json the dispatcher is None → no round=2 rows.
+        The smoke fixture does not provide round2_replies.json (M2 data only).
+        """
         db = self._env["db_path"]
         conn = sqlite3.connect(str(db))
         round2_count = conn.execute(
@@ -504,7 +507,8 @@ class TestCommitMode:
         ).fetchone()[0]
         conn.close()
         assert round2_count == 0, (
-            f"Round-2 stances found ({round2_count}). M2 must not produce any."
+            f"Round-2 stances found ({round2_count}) without a round2_dispatcher — "
+            "the None-dispatcher backward-compatible path is broken."
         )
 
     def test_round1_stances_present(self) -> None:

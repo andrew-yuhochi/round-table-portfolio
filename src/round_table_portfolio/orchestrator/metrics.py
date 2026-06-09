@@ -18,6 +18,9 @@ Usage::
 
     metrics = report_run_metrics(
         per_persona_timing={"value": 320.1, "growth": 410.3, ...},
+        per_round1_timing={"value": 180.0, "growth": 200.0, ...},
+        per_judge_timing={"value": 60.0, "growth": 55.0, ...},
+        per_round2_timing={"value": 300.0, "growth": 280.0},   # 2 outliers only
         research_results=persona_results,
         budgets=budgets,
         window_config={"window_hours": 5.0, "window_proximity_threshold": 0.80},
@@ -25,11 +28,13 @@ Usage::
     )
     print(metrics.summary_text)
 
-Design notes:
+Design notes (M3 update — DEF-003 full-cycle timing):
 - The orchestrator measures per-persona wall-clock by capturing time.time()
   before/after each subagent dispatch.  Python cannot time across subagent
   boundaries from inside this helper — the orchestrator passes the measured
-  map in.  This is the same pattern as M1-011's wall_clock_seconds.
+  maps in.  This is the same pattern as M1-011's wall_clock_seconds.
+- M3 extends this to FOUR timing maps: research, Round-1, judges, Round-2.
+  The headline total_run_time is now the SUM of all phases.
 - The helper is a pure data assembler: no subagent dispatch, no DB writes.
   Side effect: appends to the run log file (state/runs/YYYY-WNN.log).
 - FEASIBILITY VERDICT categories:
@@ -45,7 +50,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional  # noqa: F401 — Optional used in report_run_metrics signature
 
 from round_table_portfolio.budget.loader import PersonaBudget, get_budget
 from round_table_portfolio.research.runner import PersonaResearchResult
@@ -83,8 +88,12 @@ class RunMetricsReport:
     """Full metrics report for one weekly run.
 
     The orchestrator prints ``summary_text`` to the session as part of the
-    founder-facing M2-011 output.  The report is also persisted to
+    founder-facing M2-011 / M3-006 output.  The report is also persisted to
     ``state/runs/YYYY-WNN.log``.
+
+    M3 change (DEF-003): total_wall_seconds is now the SUM of ALL phases
+    (research + round1 + judges + round2), not research-only.  The per-phase
+    breakdown fields let the founder see where time is spent.
     """
     week_label: str
     total_wall_seconds: float
@@ -96,6 +105,11 @@ class RunMetricsReport:
     per_persona: list[PersonaMetrics] = field(default_factory=list)
     over_budget_personas: list[str] = field(default_factory=list)
     summary_text: str = ""
+    # Per-phase totals (M3 DEF-003 — zero when phase not run / timing not provided).
+    research_total_seconds: float = 0.0
+    round1_total_seconds: float = 0.0
+    judges_total_seconds: float = 0.0
+    round2_total_seconds: float = 0.0
 
     # Convenience accessor matching the stub's field name so callers that
     # used RunMetrics.total_wall_seconds continue to work unchanged.
@@ -127,8 +141,18 @@ def _build_summary_text(
     escalation_triggered: bool,
     per_persona: list[PersonaMetrics],
     over_budget_personas: list[str],
+    *,
+    research_total_seconds: float = 0.0,
+    round1_total_seconds: float = 0.0,
+    judges_total_seconds: float = 0.0,
+    round2_total_seconds: float = 0.0,
 ) -> str:
-    """Assemble the human-readable summary for session output."""
+    """Assemble the human-readable summary for session output.
+
+    M3 DEF-003: total includes all phases; per-phase breakdown is printed so
+    the founder sees where time is spent (research vs. Round 1 vs. judges vs.
+    Round 2).
+    """
     window_pct = window_fraction * 100.0
     duration_str = _fmt_duration(total_wall_seconds)
     window_label = _fmt_duration(window_hours * 3600)
@@ -142,14 +166,36 @@ def _build_summary_text(
         f"  Verdict:       {feasibility_verdict.upper()}",
     ]
 
+    # Per-phase breakdown — only print phases that consumed non-zero time.
+    phase_breakdown: list[str] = []
+    if research_total_seconds > 0:
+        phase_breakdown.append(
+            f"    Research:  {_fmt_duration(research_total_seconds)}"
+        )
+    if round1_total_seconds > 0:
+        phase_breakdown.append(
+            f"    Round-1:   {_fmt_duration(round1_total_seconds)}"
+        )
+    if judges_total_seconds > 0:
+        phase_breakdown.append(
+            f"    Judges:    {_fmt_duration(judges_total_seconds)}"
+        )
+    if round2_total_seconds > 0:
+        phase_breakdown.append(
+            f"    Round-2:   {_fmt_duration(round2_total_seconds)}"
+        )
+    if phase_breakdown:
+        lines += ["", "  Phase breakdown (full-cycle total above):"]
+        lines += phase_breakdown
+
     if escalation_triggered:
         lines += [
             "",
             "!! BOUNDING-PLAYBOOK ESCALATION !!",
             f"   Run consumed {window_pct:.0f}% of the {window_label} rolling window",
             f"   (threshold: {proximity_threshold*100:.0f}%).",
-            "   Before M3, choose one: fewer personas / tighter budgets / tier upgrade.",
-            "   This is a FOUNDER DECISION — do not proceed to M3 silently.",
+            "   Choose one: fewer personas / tighter budgets / tier upgrade.",
+            "   This is a FOUNDER DECISION — do not proceed silently.",
         ]
 
     lines += [
@@ -198,29 +244,43 @@ def report_run_metrics(
     budgets: dict[str, PersonaBudget],
     window_config: dict[str, Any],
     run_log_path: Path,
+    per_round1_timing: Optional[dict[str, float]] = None,
+    per_judge_timing: Optional[dict[str, float]] = None,
+    per_round2_timing: Optional[dict[str, float]] = None,
 ) -> RunMetricsReport:
     """Measure and report run-time + per-persona web-search/tool counts.
 
+    M3 change (DEF-003): the headline total_run_time is now the SUM of ALL
+    phases — research (per_persona_timing), Round-1 dispatches
+    (per_round1_timing), output-validator judge dispatches (per_judge_timing),
+    and the 2 Round-2 outlier dispatches (per_round2_timing).  Callers that
+    do not yet supply the new maps (e.g. M2 tests, backward-compatible callers)
+    receive a total equal to the research phase only — matching the M2 behaviour.
+
     Args:
         per_persona_timing:
-            Mapping of persona_slug → wall-clock seconds for that persona's
-            research dispatch.  Measured by the orchestrator around each
-            subagent dispatch (Python cannot time across subagent boundaries
-            from inside a helper).
+            Mapping of persona_slug → wall-clock seconds for the research
+            dispatch phase.  Measured by the orchestrator around each dispatch.
         research_results:
-            The 7 ``PersonaResearchResult`` objects produced by the
-            per-persona research loop.
+            The 7 ``PersonaResearchResult`` objects from the research loop.
         budgets:
-            The loaded persona-budget dict (from ``budget.loader.load_budgets``).
-            Used to compare actual web-search / tool-call counts against limits.
+            Loaded persona-budget dict (from ``budget.loader.load_budgets``).
         window_config:
             Dict with keys:
               ``window_hours`` (float, default 5.0) — the rolling-window limit.
               ``window_proximity_threshold`` (float, default 0.80) — fraction at
               which the bounding-playbook escalation fires.
         run_log_path:
-            Path to append the report to.  ``state/runs/`` is ``mkdir -p``'d
-            before writing so it does not need to pre-exist.
+            Path to append the report to.  ``state/runs/`` is mkdir-p'd.
+        per_round1_timing:
+            Mapping of persona_slug → wall-clock seconds for Round-1 dispatch.
+            None if not yet measured (backward-compatible — treated as 0).
+        per_judge_timing:
+            Mapping of persona_slug → wall-clock seconds for judge dispatch.
+            None if not yet measured (backward-compatible — treated as 0).
+        per_round2_timing:
+            Mapping of outlier_slug → wall-clock seconds for Round-2 dispatch.
+            None if Round 2 has not run yet (backward-compatible — treated as 0).
 
     Returns:
         A ``RunMetricsReport`` with all metrics populated, ``summary_text``
@@ -234,7 +294,7 @@ def report_run_metrics(
         window_config.get("window_proximity_threshold", _DEFAULT_PROXIMITY_THRESHOLD)
     )
 
-    # Build per-persona metrics.
+    # Build per-persona metrics (research phase is the reference for budget).
     per_persona: list[PersonaMetrics] = []
     over_budget_personas: list[str] = []
 
@@ -245,7 +305,6 @@ def report_run_metrics(
     for slug, wall_secs in per_persona_timing.items():
         res = result_by_slug.get(slug)
         if res is None:
-            # Timing was provided but no matching research result — log and skip.
             logger.warning("per_persona_timing has slug %r with no matching research result.", slug)
             continue
 
@@ -270,10 +329,14 @@ def report_run_metrics(
         if web_over or tools_over:
             over_budget_personas.append(slug)
 
-    # Total wall-clock is the sum of per-persona timings.  The orchestrator
-    # measures each dispatch independently; their sum is the effective run cost
-    # against the rolling window.
-    total_wall_seconds: float = sum(per_persona_timing.values())
+    # Per-phase totals (DEF-003 full-cycle timing).
+    research_total = sum(per_persona_timing.values())
+    round1_total = sum((per_round1_timing or {}).values())
+    judges_total = sum((per_judge_timing or {}).values())
+    round2_total = sum((per_round2_timing or {}).values())
+
+    # Full-cycle total — the verdict is computed against this (DEF-003 fix).
+    total_wall_seconds: float = research_total + round1_total + judges_total + round2_total
 
     window_seconds = window_hours * 3600.0
     window_fraction = total_wall_seconds / window_seconds if window_seconds > 0 else 0.0
@@ -302,6 +365,10 @@ def report_run_metrics(
         escalation_triggered=escalation_triggered,
         per_persona=per_persona,
         over_budget_personas=over_budget_personas,
+        research_total_seconds=research_total,
+        round1_total_seconds=round1_total,
+        judges_total_seconds=judges_total,
+        round2_total_seconds=round2_total,
     )
 
     report = RunMetricsReport(
@@ -315,6 +382,10 @@ def report_run_metrics(
         per_persona=per_persona,
         over_budget_personas=over_budget_personas,
         summary_text=summary_text,
+        research_total_seconds=research_total,
+        round1_total_seconds=round1_total,
+        judges_total_seconds=judges_total,
+        round2_total_seconds=round2_total,
     )
 
     # Persist to run log — mkdir -p so state/runs/ does not need to pre-exist.
@@ -328,8 +399,13 @@ def report_run_metrics(
         fh.write(log_entry)
 
     logger.info(
-        "Run metrics: total=%.1fs window_fraction=%.1f%% verdict=%s escalation=%s",
+        "Run metrics: total=%.1fs (research=%.1f r1=%.1f judges=%.1f r2=%.1f) "
+        "window_fraction=%.1f%% verdict=%s escalation=%s",
         total_wall_seconds,
+        research_total,
+        round1_total,
+        judges_total,
+        round2_total,
         window_fraction * 100,
         feasibility_verdict,
         escalation_triggered,
@@ -338,7 +414,7 @@ def report_run_metrics(
     if escalation_triggered:
         logger.warning(
             "BOUNDING-PLAYBOOK ESCALATION: run consumed %.0f%% of the %.1fh window. "
-            "Raise to founder before M3.",
+            "Raise to founder.",
             window_fraction * 100,
             window_hours,
         )

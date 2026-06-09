@@ -1,7 +1,7 @@
 """weekly_run_orchestrator — Component 12, the sole ledger writer.
 
-The spine of M2.  Sequences ONE week end-to-end (Round 1 only — Round 2 is M3)
-and is the ONLY writer of:
+The spine of M3.  Sequences ONE week end-to-end (Round 1 + Round 2) and is the
+ONLY writer of:
   weeks, portfolios, holdings, agent_stances, transcripts,
   persona_reports, persona_shortlists,
   state/memory/, state/reports/, state/debates/
@@ -16,6 +16,7 @@ Entry point::
         persona_replies={"value": "<raw JSON>", ...},  # 7 entries
         founder_reply="approve",
         judge=StubOnMandateJudge(),
+        round2_dispatcher=my_stub_dispatcher,  # callable(outlier_slug, counterarg_block) -> str
     )
 
 Engine / session split (TDD §1.1)
@@ -23,25 +24,37 @@ Engine / session split (TDD §1.1)
 - The Claude session dispatches each persona subagent and captures raw JSON.
 - ``run_weekly`` receives those raw strings via ``persona_replies`` and does all
   post-dispatch work: parse → validate → debate-set → Round-1 stances →
-  consensus → ledger write → transcript → memory write-back → metrics.
+  Round-2 (2 outlier dispatches via injected ``round2_dispatcher``) →
+  re-synthesis → consensus → ledger write → transcript → memory write-back →
+  metrics.
 - In tests, inject canned ``persona_replies`` + a ``StubOnMandateJudge`` +
-  set ``STUB_ALLOW=1``.  No live subagent is spawned.
-- In production (TASK-M2-011), the session collects real replies and passes them
-  in; STUB_ALLOW is not set so the real sibling helpers run.
+  a stub ``round2_dispatcher`` returning canned JSON + set ``STUB_ALLOW=1``.
+  No live subagent is spawned.
+- In production (TASK-M3-006), the session collects real replies and passes them
+  in; ``round2_dispatcher`` is backed by real Agent dispatches.
 
-Round-2 boundary (TDD §1.1, TASKS.md M2-003 AC #3)
----------------------------------------------------
-Round 2 is M3.  After Round 1 this function proceeds straight to the
-consensus-equivalent.  There is NO Round-2 dispatch path in this module —
-the absence is intentional and tested.
+Round-2 dispatch seam (TDD §1.1 M3 change)
+--------------------------------------------
+``round2_dispatcher`` is a callable with signature:
+    (outlier_slug: str, counterargument_block: str) -> str
+It receives the outlier persona slug and the assembled counterargument text
+(Component 23 output), and must return the raw Round-2 JSON reply string.
+The live session backs this with a real Agent dispatch; tests back it with a
+stub that returns canned JSON.  This mirrors the M2 ``persona_replies`` seam
+exactly — Python cannot spawn Claude Code subagents; the session does it.
+Exactly 2 calls are made (one per selected outlier) — the cost contract.
 
 Transaction boundary (TDD §1.5)
 --------------------------------
-All 8 portfolios (1 consensus + 7 named) + their holdings + agent_stances +
-persona_reports + persona_shortlists + weeks + transcripts are written in ONE
-SQLite transaction.  Any write failure triggers ROLLBACK — zero rows for that
-week_id survive.  Memory write-back happens AFTER the commit so memory never
-references a week that does not exist in the ledger.
+All 8 portfolios (1 FINAL consensus + 7 named counterfactuals) + their holdings
++ round=1 agent_stances + round=2 agent_stances (2 outliers) + persona_reports
++ persona_shortlists + weeks + transcripts (R1+R2) are written in ONE SQLite
+transaction.  Any write failure triggers ROLLBACK — zero rows for that week_id
+survive.  Memory write-back happens AFTER the commit so memory never references
+a week that does not exist in the ledger.
+The canonical 8th portfolio is the post-Round-2 FINAL consensus; the Round-1
+provisional consensus is recorded in the transcript only (no duplicate portfolio
+row).
 """
 
 from __future__ import annotations
@@ -88,8 +101,11 @@ from round_table_portfolio.portfolio.materialize import (
     materialize_portfolios,
 )
 
-# Component 17 — real implementation (TASK-M2-007).
-from round_table_portfolio.orchestrator.transcript import write_round1_transcript
+# Component 17 — real implementation (TASK-M2-007 / M3 extended).
+from round_table_portfolio.orchestrator.transcript import (
+    append_round2_transcript,
+    write_round1_transcript,
+)
 
 # Components 21 + 22 — real implementation (TASK-M3-001).
 from round_table_portfolio.orchestrator.dissent import (
@@ -98,6 +114,25 @@ from round_table_portfolio.orchestrator.dissent import (
     compute_dissent,
     load_dissent_config,
     select_outliers,
+)
+
+# Component 23 — real implementation (TASK-M3-002).
+from round_table_portfolio.orchestrator.counterargument import (
+    CounterargumentBlock,  # noqa: F401 — shape used by tests
+    assemble_counterarguments,
+    load_counterargument_config,
+)
+
+# Component 24 — real implementation (TASK-M3-003).
+from round_table_portfolio.orchestrator.round2 import (
+    Round2Reply,        # noqa: F401 — shape used by tests
+    capture_round2_stances,
+)
+
+# Component 25 — real implementation (TASK-M3-004).
+from round_table_portfolio.orchestrator.resynthesis import (
+    ResynthesisResult,  # noqa: F401 — shape used by tests
+    resynthesize_consensus,
 )
 
 # Component 18 — real implementation (TASK-M2-008).
@@ -255,6 +290,7 @@ def _write_week_transaction(
     run_date: str,
     portfolio_payloads: list[Any],
     stances: list[Any],
+    round2_stances: list[Any],
     persona_results: list[PersonaResearchResult],
     transcript_path: Path,
     transcript_summary: str,
@@ -266,10 +302,9 @@ def _write_week_transaction(
 ) -> None:
     """Write all rows for one week inside the caller's transaction.
 
-    The caller must have already called conn.execute("BEGIN") and must call
-    conn.commit() or conn.rollback() afterwards.  This function does NOT
-    manage the transaction boundary itself — it only executes the INSERT
-    statements so the rollback behaviour is testable by the caller.
+    Writes round=1 stances (all 7 personas) + round=2 stances (2 outliers) in
+    one atomic block.  The caller must have already called conn.execute("BEGIN")
+    and must call conn.commit() or conn.rollback() afterwards.
 
     Raises:
         sqlite3.Error: On any constraint violation or I/O error.  The caller
@@ -316,8 +351,8 @@ def _write_week_transaction(
                 ),
             )
 
-    # agent_stances rows (round=1 only — no round=2 in M2).
-    for s in stances:
+    # agent_stances rows — round=1 (all 7 personas) + round=2 (2 outliers).
+    for s in stances + round2_stances:
         conn.execute(
             """
             INSERT INTO agent_stances
@@ -423,6 +458,7 @@ class WeeklyRunResult:
     """Everything produced by a single run_weekly call.
 
     All ledger rows have been written (or rolled back on failure).
+    M3 additions: num_round2_stances, resynthesis, provisional_weights.
     """
 
     week_id: str
@@ -431,11 +467,14 @@ class WeeklyRunResult:
     debate_set: list[str]
     num_portfolios_written: int   # should always be 8 on success
     num_stances_written: int      # 7 × |debate_set| round-1 stances
+    num_round2_stances: int       # 2 outliers × their debate-set stances
     num_persona_reports: int      # 7
     transcript_path: Optional[Path]
     metrics: Any                  # RunMetricsReport from metrics.py (Component 19)
     dissent: Any                  # DissentResult from dissent.py (Component 21)
     outliers: Any                 # OutlierSelection from dissent.py (Component 22)
+    resynthesis: Any              # ResynthesisResult from resynthesis.py (Component 25)
+    provisional_weights: dict     # Round-1 consensus weights (for transcript/metrics)
     persona_results: list[PersonaResearchResult] = field(default_factory=list)
 
 
@@ -453,6 +492,16 @@ def run_weekly(
     founder_reply: Optional[str] = None,
     reprompt_fn: Optional[Any] = None,
     judge: Optional[OnMandateJudge] = None,
+    # Round-2 dispatch seam (M3 — mirrors the M2 persona_replies seam).
+    # Signature: (outlier_slug: str, counterargument_block: str) -> str (raw JSON).
+    # Live session backs this with a real Agent dispatch.
+    # Tests back this with a stub returning canned round-2 JSON.
+    # When None, no Round-2 is performed (backward-compatible for legacy tests).
+    round2_dispatcher: Optional[Any] = None,
+    # Per-phase timing maps for full-cycle metrics (M3 DEF-003).
+    # When None, treated as {} — that phase's time contributes 0 to the total.
+    per_round1_timing: Optional[dict[str, float]] = None,
+    per_judge_timing: Optional[dict[str, float]] = None,
     # Config overrides (for testing).
     personas_config: Optional[Path] = None,
     budget_config: Optional[Path] = None,
@@ -465,7 +514,7 @@ def run_weekly(
     db_path: Optional[Path] = None,
     user_id: str = "andrew",
 ) -> WeeklyRunResult:
-    """Run the full single-week cycle (Round 1 + consensus, NO Round 2).
+    """Run the full single-week cycle (Round 1 + Round 2 + re-synthesis).
 
     Args:
         project:          Project name (informational; used in log messages).
@@ -490,6 +539,17 @@ def run_weekly(
                           or for the second re-prompt on ambiguity.
         judge:            OnMandateJudge implementation.  Pass StubOnMandateJudge
                           in tests.  In production the session wires a real judge.
+        round2_dispatcher: Optional callable (outlier_slug: str, counterarg: str) → str.
+                          The seam for the 2 Round-2 outlier dispatches.  The live
+                          session backs this with a real Agent dispatch; tests use a
+                          stub returning canned JSON.  When None, Round-2 is skipped
+                          (backward-compatible path — provisional R1 consensus is used
+                          as the final consensus, no round=2 stances are written).
+        per_round1_timing: Dict[slug, float] — wall-clock seconds per persona for
+                          Round-1 dispatch.  None → treated as {}, contributing 0s
+                          to the full-cycle total (DEF-003).
+        per_judge_timing:  Dict[slug, float] — wall-clock seconds per persona for
+                          judge dispatch.  None → treated as {}, contributing 0s.
         personas_config:  Override path to personas.yaml (for tests).
         budget_config:    Override path to persona_budgets.yaml (for tests).
         validator_config_obj: Pre-built ValidatorConfig (for tests — avoids file I/O).
@@ -500,17 +560,14 @@ def run_weekly(
         user_id:          Owner field; default "andrew".
 
     Returns:
-        WeeklyRunResult with the week_id, decision, and row counts.
+        WeeklyRunResult with the week_id, decision, row counts, and M3 outputs.
 
     Raises:
         RuntimeError:   If any persona's research/validation fails (per TDD §1.5
-                        abort rule — no partial runs at PoC).
+                        abort rule — no partial runs at PoC), or if
+                        capture_round2_stances receives != 2 replies.
         sqlite3.Error:  If the ledger transaction fails (caller sees the rolled-
                         back exception; zero rows for this week_id survive).
-
-    Round-2 assertion (AC #3):
-        This function contains NO Round-2 dispatch path.  The absence is
-        enforced by the test suite (test_no_round2_reachable).
     """
     # ------------------------------------------------------------------
     # 0. Resolve paths and load configs.
@@ -643,20 +700,112 @@ def run_weekly(
             )
 
     # ------------------------------------------------------------------
-    # 4. Consensus-equivalent (Component 16 — stub → TASK-M2-006).
-    #    Round-2 is NOT invoked in M2.
+    # 4. Round-1 provisional consensus (Component 16 — blend_consensus).
+    #    This is the PROVISIONAL consensus used as the Round-2 baseline.
     # ------------------------------------------------------------------
-    consensus_weights = blend_consensus(
+    provisional_weights = blend_consensus(
         round1.stances,
         config={"max_position_weight": max_position_weight},
     )
 
     # ------------------------------------------------------------------
-    # 5. Materialize portfolios (Component 15 — real implementation TASK-M2-005).
+    # 5. Steps 6a–6e: Round-2 phase (M3).  If no round2_dispatcher is
+    #    provided, skip Round-2 and use the provisional consensus as final.
+    # ------------------------------------------------------------------
+
+    # 6a. Compute recalibrated dissent score (Component 21).
+    dissent_cfg = load_dissent_config(thresholds_config)
+    dissent_result = compute_dissent(round1.stances, debate_set, dissent_cfg)
+
+    # 6b. Select the 2 most-divergent personas (Component 22).
+    outliers = select_outliers(dissent_result, round1.stances, dissent_cfg)
+    logger.info(
+        "[%s] Dissent: score=%.4f contested=%s outliers=%s",
+        project, dissent_result.dissent_score, dissent_result.contested_week,
+        outliers.selected,
+    )
+
+    # Collect R1 rationales for Component 23.
+    # rationales[persona][ticker] = rationale text from round1 stances.
+    def _get_attr(obj: Any, attr: str) -> Any:
+        return obj[attr] if isinstance(obj, dict) else getattr(obj, attr)
+
+    r1_rationales: dict[str, dict[str, str]] = {}
+    for s in round1.stances:
+        persona = _get_attr(s, "persona")
+        ticker = _get_attr(s, "ticker")
+        rationale = _get_attr(s, "rationale")
+        r1_rationales.setdefault(persona, {})[ticker] = rationale
+
+    # 6c. Assemble counterarguments deterministically (Component 23 — NO dispatch).
+    ca_cfg = load_counterargument_config(thresholds_config)
+    counterargument_blocks = assemble_counterarguments(
+        outlier_slugs=outliers.selected,
+        all_stances=round1.stances,
+        rationales=r1_rationales,
+        config=ca_cfg,
+    )
+
+    # 6d. Dispatch 2 Round-2 outliers (seam — session backs with real Agent calls;
+    #     tests back with a stub).  Exactly 2 calls — the cost contract.
+    round2_raw_replies: dict[str, str] = {}
+    per_round2_timing: dict[str, float] = {}
+
+    if round2_dispatcher is not None:
+        for outlier_slug in outliers.selected:
+            cb = counterargument_blocks[outlier_slug]
+            _r2_t0 = time.time()
+            raw_r2 = round2_dispatcher(outlier_slug, cb.block)
+            per_round2_timing[outlier_slug] = time.time() - _r2_t0
+            round2_raw_replies[outlier_slug] = raw_r2
+            logger.info(
+                "[%s] Round-2 reply captured for outlier=%s (%.1fs)",
+                project, outlier_slug, per_round2_timing[outlier_slug],
+            )
+
+    # Parse + build round=2 AgentStancePayload rows (Component 24).
+    round2_stances_all: list[Any] = []
+    round2_replies: dict[str, Any] = {}
+    if round2_raw_replies:
+        r2_captures = capture_round2_stances(
+            round2_raw_replies,
+            week_id=week_label,
+            config={"max_position_weight": max_position_weight},
+            user_id=user_id,
+        )
+        for slug, (r2_reply, r2_payloads) in r2_captures.items():
+            round2_stances_all.extend(r2_payloads)
+            round2_replies[slug] = r2_reply
+
+    # 6e. Re-synthesize consensus via SAME blend_consensus over updated stance set
+    #     (Component 25).  If no Round-2 ran, use the provisional weights as final.
+    if round2_stances_all:
+        resynth = resynthesize_consensus(
+            round1_stances=round1.stances,
+            round2_payloads=round2_stances_all,
+            outlier_personas=set(outliers.selected),
+            provisional_weights=provisional_weights,
+            config={"max_position_weight": max_position_weight},
+        )
+        final_weights = resynth.final_weights
+    else:
+        # No Round-2 (no dispatcher provided) — provisional is final.
+        from round_table_portfolio.orchestrator.resynthesis import ResynthesisResult
+        resynth = ResynthesisResult(
+            final_weights=provisional_weights,
+            provisional_weights=provisional_weights,
+            delta={},
+            merged_stances=list(round1.stances),
+            outlier_personas=frozenset(),
+        )
+        final_weights = provisional_weights
+
+    # ------------------------------------------------------------------
+    # 6. Materialize portfolios (Component 15) using the FINAL consensus weights.
     # ------------------------------------------------------------------
     portfolio_payloads = materialize_portfolios(
         round1.counterfactuals,
-        consensus_weights,
+        final_weights,
         prior_portfolios=None,   # first week — no prior; M4+ will supply this
         week_id=week_label,
         entry_date=run_date,
@@ -666,17 +815,6 @@ def run_weekly(
         },
     )
 
-    # ------------------------------------------------------------------
-    # 6. Compute dissent metrics for transcript (Component 21 + 22).
-    # ------------------------------------------------------------------
-    dissent_cfg = load_dissent_config(thresholds_config)
-    dissent_result = compute_dissent(round1.stances, debate_set, dissent_cfg)
-    outliers = select_outliers(dissent_result, round1.stances, dissent_cfg)
-    logger.info(
-        "[%s] Dissent: score=%.4f contested=%s outliers=%s",
-        project, dissent_result.dissent_score, dissent_result.contested_week,
-        outliers.selected,
-    )
     # Per-ticker σ (new signed-score basis) feeds the transcript dissent note.
     std_devs = dissent_result.per_ticker_sigma
     vote_tally = _vote_tally_json(round1.stances, debate_set)
@@ -684,6 +822,7 @@ def run_weekly(
     # ------------------------------------------------------------------
     # 7. Write transcript FILE first (atomic — so the path exists before
     #    the DB row is written, satisfying full_log_path NOT NULL).
+    #    7a: Round-1 section  →  7b: Round-2 section appended.
     # ------------------------------------------------------------------
     # Resolve founder decision before writing transcript.
     if founder_reply is not None:
@@ -700,8 +839,6 @@ def run_weekly(
     def _second_reprompt() -> str:
         if reprompt_fn is not None:
             return reprompt_fn()
-        # Tests that pass founder_reply directly hit this only on ambiguous input;
-        # they should pass a clearly-parseable string so this path is not needed.
         return "approve"
 
     decision_type, decision_delta = _parse_reply_with_reprompt(
@@ -710,18 +847,34 @@ def run_weekly(
 
     transcript_path = write_round1_transcript(
         round1,
-        consensus_weights,
+        provisional_weights,
         std_devs,
         decision_type,
         week_id=week_label,
         state_root=_state,
     )
+
+    # 7b. Append Round-2 section if Round-2 was performed.
+    if round2_stances_all:
+        append_round2_transcript(
+            transcript_path,
+            dissent_result=dissent_result,
+            outliers=outliers,
+            counterargument_blocks=counterargument_blocks,
+            round2_replies=round2_replies,
+            resynthesis_result=resynth,
+        )
+
     transcript_summary = (
-        f"Round-1 consensus for {week_label}. Decision: {decision_type}."
+        f"R1+R2 consensus for {week_label}. Decision: {decision_type}."
+        if round2_stances_all
+        else f"Round-1 consensus for {week_label}. Decision: {decision_type}."
     )
 
     # ------------------------------------------------------------------
     # 8. ONE-TRANSACTION ledger write.  Roll back ALL rows if any write fails.
+    #    Writes: round=1 stances + round=2 stances + FINAL consensus portfolio
+    #    + 7 counterfactuals + persona_reports + weeks + transcripts.
     # ------------------------------------------------------------------
     conn = sqlite3.connect(str(_db))
     try:
@@ -733,6 +886,7 @@ def run_weekly(
             run_date=run_date,
             portfolio_payloads=portfolio_payloads,
             stances=round1.stances,
+            round2_stances=round2_stances_all,
             persona_results=persona_results,
             transcript_path=transcript_path,
             transcript_summary=transcript_summary,
@@ -775,12 +929,12 @@ def run_weekly(
     )
 
     # ------------------------------------------------------------------
-    # 10. Metrics — Component 19 (TASK-M2-009 real implementation).
-    #     The helper assembles the full report, persists it to the run log,
-    #     and returns the report object for session printing (M2-011).
+    # 10. Metrics — Component 19 (M3 DEF-003: full-cycle timing).
+    #     Passes all 4 timing maps so the total covers research + R1 + judges
+    #     + Round-2.  run_log_path is written with a summary preamble first;
+    #     report_run_metrics appends the full report below it.
     # ------------------------------------------------------------------
     run_log_path = _state / "runs" / f"{week_label}.log"
-    # Write run-summary preamble first; report_run_metrics appends below it.
     run_log_path.parent.mkdir(parents=True, exist_ok=True)
     run_log_path.write_text(
         f"week={week_label}\n"
@@ -788,6 +942,7 @@ def run_weekly(
         f"delta={decision_delta!r}\n"
         f"portfolios={len(portfolio_payloads)}\n"
         f"stances={len(round1.stances)}\n"
+        f"round2_stances={len(round2_stances_all)}\n"
         f"persona_reports={len(persona_results)}\n"
         f"debate_set_size={len(debate_set)}\n",
         encoding="utf-8",
@@ -798,6 +953,9 @@ def run_weekly(
         budgets=budgets,
         window_config=window_config,
         run_log_path=run_log_path,
+        per_round1_timing=per_round1_timing or {},
+        per_judge_timing=per_judge_timing or {},
+        per_round2_timing=per_round2_timing,
     )
 
     return WeeklyRunResult(
@@ -807,10 +965,13 @@ def run_weekly(
         debate_set=debate_set,
         num_portfolios_written=len(portfolio_payloads),
         num_stances_written=len(round1.stances),
+        num_round2_stances=len(round2_stances_all),
         num_persona_reports=len(persona_results),
         transcript_path=transcript_path,
         metrics=metrics,
         dissent=dissent_result,
         outliers=outliers,
+        resynthesis=resynth,
+        provisional_weights=provisional_weights,
         persona_results=persona_results,
     )

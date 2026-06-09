@@ -333,12 +333,19 @@ class TestA2_FullyInvestedCashInvariant:
         )
 
 
-class TestA3_Round1OnlyStances:
-    """A3: agent_stances are round=1 ONLY.  No round=2 rows anywhere.
-    Exact count: 7 personas × 40 debate-set tickers = 280.
+class TestA3_StanceRounds:
+    """A3 (M3): agent_stances have round=1 (all 7 personas) and round=2 (0 outlier
+    dispatches in this fixture since no round2_dispatcher is wired into e2e_env).
+
+    The e2e fixture uses run_commit() without a round2_replies.json file, so
+    round2_dispatcher is None — Round-2 is skipped (backward-compatible path).
+    Round=1 count must still be exactly 280.
+
+    The Round-2-present assertions live in the unit tests (TestRound2Present).
     """
 
-    def test_no_round2_stances(self, e2e_env: dict) -> None:
+    def test_no_round2_stances_when_no_dispatcher(self, e2e_env: dict) -> None:
+        """Without round2_replies.json the dispatcher is None → no round=2 rows."""
         conn = _open_ro(e2e_env["db_path"])
         round2 = conn.execute(
             "SELECT COUNT(*) FROM agent_stances WHERE week_id=? AND round=2",
@@ -346,8 +353,8 @@ class TestA3_Round1OnlyStances:
         ).fetchone()[0]
         conn.close()
         assert round2 == 0, (
-            f"Round-2 stances found ({round2}).  "
-            "M2 must not produce any Round-2 stances (M2 scope boundary)."
+            f"Round-2 stances found ({round2}) without a round2_dispatcher — "
+            "the None-dispatcher backward-compatible path is broken."
         )
 
     def test_round1_stance_count_is_exactly_280(self, e2e_env: dict) -> None:
@@ -637,13 +644,17 @@ class TestB_RealLedger2026W24:
             + "\n".join(violations)
         )
 
-    def test_real_no_round2_stances(self) -> None:
+    def test_real_m2_ledger_has_no_round2_stances(self) -> None:
+        """The 2026-W24 real ledger is an M2 run — round=2 stances were not written.
+        This is expected: the M2 weekly run had no round2_dispatcher.
+        """
         round2 = self._conn.execute(
             "SELECT COUNT(*) FROM agent_stances WHERE week_id=? AND round=2",
             (_WEEK_ID,),
         ).fetchone()[0]
         assert round2 == 0, (
-            f"Real ledger: {round2} round-2 stances found (M2 scope boundary violated)."
+            f"Real ledger (M2 run 2026-W24): {round2} round-2 stances found. "
+            "The M2 run had no Round-2 dispatcher — this is unexpected."
         )
 
     def test_real_stance_count_exactly_280(self) -> None:
@@ -717,40 +728,49 @@ class TestB_RealLedger2026W24:
 
 
 # ===========================================================================
-# Source-code fence: no round-2 dispatch path exists in weekly_run.py
+# Source-code fence: Round-2 dispatch seam IS present in weekly_run.py (M3)
 # ===========================================================================
 
 
-class TestNoRound2InSourceCode:
-    """Assert there is no round-2 dispatch path reachable from weekly_run.py.
+class TestRound2InSourceCode:
+    """Assert that the Round-2 dispatch seam IS wired in weekly_run.py.
 
-    This is a static guard: if a Round-2 call were added to the orchestrator,
-    this test catches it immediately (before any data is written).
+    M3 inversion of the M2 TestNoRound2InSourceCode fence.
+    These positive guards ensure the wiring is never accidentally removed.
     """
 
-    def test_run_weekly_source_has_no_round2_dispatch(self) -> None:
+    def test_run_weekly_source_has_round2_dispatcher_seam(self) -> None:
+        """weekly_run.py must reference 'round2_dispatcher' — the injected seam."""
         weekly_run_src = (
             _PROJECT_ROOT / "src" / "round_table_portfolio"
             / "orchestrator" / "weekly_run.py"
         ).read_text(encoding="utf-8")
 
-        # Strip comments (lines starting with optional whitespace + #) so that
-        # legitimate documentation of Round-2's ABSENCE (e.g. "round=1 only —
-        # no round=2 in M2") does not trigger a false positive.
-        non_comment_lines = [
-            line for line in weekly_run_src.splitlines()
-            if not line.lstrip().startswith("#")
-        ]
-        executable_src = "\n".join(non_comment_lines)
+        assert "round2_dispatcher" in weekly_run_src, (
+            "weekly_run.py does not contain 'round2_dispatcher' — "
+            "the Round-2 dispatch seam (M3 AC #1) is absent."
+        )
 
-        # round=2 in executable code means a Round-2 stance is being written.
-        assert "round=2" not in executable_src, (
-            "weekly_run.py contains 'round=2' in executable code — "
-            "a Round-2 write path was introduced."
+    def test_run_weekly_source_imports_capture_round2_stances(self) -> None:
+        """weekly_run.py must import 'capture_round2_stances' (Component 24)."""
+        weekly_run_src = (
+            _PROJECT_ROOT / "src" / "round_table_portfolio"
+            / "orchestrator" / "weekly_run.py"
+        ).read_text(encoding="utf-8")
+
+        assert "capture_round2_stances" in weekly_run_src, (
+            "weekly_run.py does not import 'capture_round2_stances' — "
+            "Component 24 is not wired in."
         )
-        assert "capture_round2" not in executable_src, (
-            "weekly_run.py imports or calls 'capture_round2' — Round-2 dispatch present."
-        )
-        assert "round_2_replies" not in executable_src, (
-            "weekly_run.py references 'round_2_replies' — Round-2 dispatch present."
+
+    def test_run_weekly_source_imports_resynthesize_consensus(self) -> None:
+        """weekly_run.py must import 'resynthesize_consensus' (Component 25)."""
+        weekly_run_src = (
+            _PROJECT_ROOT / "src" / "round_table_portfolio"
+            / "orchestrator" / "weekly_run.py"
+        ).read_text(encoding="utf-8")
+
+        assert "resynthesize_consensus" in weekly_run_src, (
+            "weekly_run.py does not import 'resynthesize_consensus' — "
+            "Component 25 (re-synthesis) is not wired in."
         )

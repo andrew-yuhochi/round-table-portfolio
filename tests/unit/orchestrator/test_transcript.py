@@ -26,10 +26,26 @@ Coverage matrix:
     test_atomic_write_prior_file_intact_on_failure     — prior file unchanged when rename fails
     test_atomic_write_no_partial_file_at_target        — target path has no partial content on failure
 
-  AC5 — full test suite passes (verified by running all tests via pytest):
+  AC5 — Round-2 append: 5-part structure + provenance (M3 follow-up gap coverage):
+    test_round2_heading_present                        — "## Round 2" heading appears
+    test_dissent_score_section_present                 — "### Dissent Score" + score value
+    test_contested_flag_present                        — contested_week flag text appears
+    test_outliers_section_present                      — "### Selected Outliers" + both slugs + divergence scores
+    test_counterarguments_section_present              — "### Counterarguments" heading present
+    test_provenance_source_persona_present             — source persona slug appears in counterargument block
+    test_provenance_rationale_text_present             — source rationale excerpt appears in block
+    test_missing_provenance_is_catchable               — a block with empty source_rationales has NO provenance text
+    test_round2_responses_section_present              — "### Round-2 Responses" + both outlier slugs
+    test_rebuttal_narrative_present                    — rebuttal_narrative text appears per outlier
+    test_consensus_shift_section_present               — "### Consensus Shift" heading present
+    test_consensus_shift_shows_r1_and_r2_deltas        — provisional and final weights both appear in the table
+    test_round1_section_preserved_after_append         — "## Round 1" still present after append
+    test_anchor_replaced_not_duplicated                — insert anchor absent after append
+
+  AC6 — full test suite passes (verified by running all tests via pytest):
     (This is the passing criterion for the whole file — no individual test for it.)
 
-Sample count: ≥13 cells across all tests.
+Sample count: ≥27 cells across all tests.
 """
 
 from __future__ import annotations
@@ -42,11 +58,16 @@ from typing import Any
 
 import pytest
 
+from round_table_portfolio.orchestrator.counterargument import CounterargumentBlock
+from round_table_portfolio.orchestrator.dissent import DissentResult, OutlierSelection
+from round_table_portfolio.orchestrator.resynthesis import ResynthesisResult
 from round_table_portfolio.orchestrator.round1 import AgentStancePayload, Round1Capture
+from round_table_portfolio.orchestrator.round2 import Round2Reply, Round2Stance
 from round_table_portfolio.orchestrator.transcript import (
     TranscriptPayload,
     _atomic_write,
     _build_vote_tally,
+    append_round2_transcript,
     write_round1_transcript,
 )
 
@@ -526,3 +547,278 @@ class TestTranscriptEdgeCases:
         )
         assert path.parent.exists()
         assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# AC5 — Round-2 append: 5-part structure including provenance (M3 gap coverage)
+# ---------------------------------------------------------------------------
+
+# Outlier slugs used across this test class.
+_OUTLIER_A = "growth"
+_OUTLIER_B = "cta-systematic-macro"
+
+# Source personas whose rationales feed the counterargument for _OUTLIER_A.
+_SOURCE_PERSONA_1 = "value"
+_SOURCE_PERSONA_2 = "risk-officer"
+_SOURCE_RATIONALE_1 = "Strong free-cash-flow generation supports a higher weight."
+_SOURCE_RATIONALE_2 = "Elevated leverage ratio warrants defensive positioning here."
+
+
+def _make_dissent_result(contested: bool = True) -> DissentResult:
+    return DissentResult(
+        dissent_score=0.62,
+        contested_week=contested,
+        per_ticker_sigma={"AAPL": 0.15, "MSFT": 0.09},
+        per_persona_divergence={
+            _OUTLIER_A: 0.31,
+            _OUTLIER_B: 0.24,
+            "value": 0.05,
+            "technical": 0.04,
+        },
+    )
+
+
+def _make_outlier_selection() -> OutlierSelection:
+    return OutlierSelection(
+        selected=[_OUTLIER_A, _OUTLIER_B],
+        stances_by_persona={
+            _OUTLIER_A: [],
+            _OUTLIER_B: [],
+        },
+    )
+
+
+def _make_counterargument_blocks() -> dict[str, CounterargumentBlock]:
+    """Counterargument block for OUTLIER_A includes two source rationales; OUTLIER_B has none."""
+    block_a = CounterargumentBlock(
+        outlier_slug=_OUTLIER_A,
+        debated_tickers=["AAPL"],
+        block=(
+            f"[{_SOURCE_PERSONA_1} on AAPL]: {_SOURCE_RATIONALE_1} "
+            f"[{_SOURCE_PERSONA_2} on AAPL]: {_SOURCE_RATIONALE_2}"
+        ),
+        source_rationales=[
+            (_SOURCE_PERSONA_1, "AAPL", _SOURCE_RATIONALE_1),
+            (_SOURCE_PERSONA_2, "AAPL", _SOURCE_RATIONALE_2),
+        ],
+    )
+    block_b = CounterargumentBlock(
+        outlier_slug=_OUTLIER_B,
+        debated_tickers=["MSFT"],
+        block="",
+        source_rationales=[],
+    )
+    return {_OUTLIER_A: block_a, _OUTLIER_B: block_b}
+
+
+def _make_round2_replies() -> dict[str, Round2Reply]:
+    reply_a = Round2Reply(
+        persona=_OUTLIER_A,
+        rebuttal_narrative="I acknowledge the leverage concern but maintain conviction on FCF.",
+        stances=[
+            Round2Stance(
+                ticker="AAPL",
+                action="add",
+                target_weight=0.12,
+                confidence=4,
+                rationale="FCF growth supports overweight despite elevated leverage.",
+                position_change="defended",
+            ),
+        ],
+    )
+    reply_b = Round2Reply(
+        persona=_OUTLIER_B,
+        rebuttal_narrative="The panel's macro view is compelling; revising to hold.",
+        stances=[
+            Round2Stance(
+                ticker="MSFT",
+                action="hold",
+                target_weight=0.08,
+                confidence=3,
+                rationale="Macro headwinds reduce conviction; moving to hold.",
+                position_change="revised",
+            ),
+        ],
+    )
+    return {_OUTLIER_A: reply_a, _OUTLIER_B: reply_b}
+
+
+def _make_resynthesis_result() -> ResynthesisResult:
+    provisional = {"AAPL": 0.12, "MSFT": 0.10}
+    final = {"AAPL": 0.12, "MSFT": 0.08}
+    delta = {"AAPL": 0.0, "MSFT": -0.02}
+    return ResynthesisResult(
+        final_weights=final,
+        provisional_weights=provisional,
+        delta=delta,
+        merged_stances=[],
+        outlier_personas=frozenset({_OUTLIER_A, _OUTLIER_B}),
+    )
+
+
+def _write_round1_and_append_round2(tmp_path: Path) -> tuple[Path, str]:
+    """Helper: write a Round-1 transcript, append Round-2, return (path, content)."""
+    thresholds = _make_thresholds_yaml(tmp_path)
+    capture = _make_round1_capture()
+    path = write_round1_transcript(
+        capture,
+        _make_consensus(),
+        _make_std_devs(high=True),
+        "panel_approved",
+        week_id=WEEK_ID,
+        state_root=tmp_path / "state",
+        thresholds_path=thresholds,
+    )
+    append_round2_transcript(
+        path,
+        dissent_result=_make_dissent_result(),
+        outliers=_make_outlier_selection(),
+        counterargument_blocks=_make_counterargument_blocks(),
+        round2_replies=_make_round2_replies(),
+        resynthesis_result=_make_resynthesis_result(),
+    )
+    return path, path.read_text(encoding="utf-8")
+
+
+class TestRound2Append:
+    """AC5: append_round2_transcript emits all 5 parts IN ORDER, including provenance."""
+
+    @pytest.fixture
+    def r2_content(self, tmp_path: Path) -> str:
+        _, content = _write_round1_and_append_round2(tmp_path)
+        return content
+
+    # Part 1 — Dissent score + contested flag
+    def test_round2_heading_present(self, r2_content: str) -> None:
+        """Part 1: ## Round 2 heading is present."""
+        assert "## Round 2" in r2_content
+
+    def test_dissent_score_section_present(self, r2_content: str) -> None:
+        """Part 1: ### Dissent Score section present with the actual score value."""
+        assert "### Dissent Score" in r2_content
+        # Score is 0.62 — formatted as 4 decimal places.
+        assert "0.6200" in r2_content
+
+    def test_contested_flag_present(self, r2_content: str) -> None:
+        """Part 1: contested_week=True → 'YES — week marked as contested' appears."""
+        assert "YES — week marked as contested" in r2_content
+
+    # Part 2 — Selected outliers + divergence scores
+    def test_outliers_section_present(self, r2_content: str) -> None:
+        """Part 2: ### Selected Outliers section + both slugs + divergence scores."""
+        assert "### Selected Outliers" in r2_content
+        assert _OUTLIER_A in r2_content
+        assert _OUTLIER_B in r2_content
+        # growth divergence = 0.31 → "0.3100"
+        assert "0.3100" in r2_content
+
+    # Part 3 — Counterarguments + provenance (the critical TDD ~line 1297 requirement)
+    def test_counterarguments_section_present(self, r2_content: str) -> None:
+        """Part 3: ### Counterarguments section heading is present."""
+        assert "### Counterarguments" in r2_content
+
+    def test_provenance_source_persona_present(self, r2_content: str) -> None:
+        """Part 3 (provenance): source persona slug appears in the counterargument block."""
+        assert _SOURCE_PERSONA_1 in r2_content
+        assert _SOURCE_PERSONA_2 in r2_content
+
+    def test_provenance_rationale_text_present(self, r2_content: str) -> None:
+        """Part 3 (provenance): source rationale excerpts appear in the block.
+
+        This is the key provenance assertion: the assembled counterargument must
+        QUOTE the opposing personas' Round-1 rationale text, not just reference
+        their slugs.  A transcript that omits rationale text fails this test.
+        """
+        # _SOURCE_RATIONALE_1 is 52 chars — well under the 200-char excerpt cap.
+        assert _SOURCE_RATIONALE_1 in r2_content
+        assert _SOURCE_RATIONALE_2 in r2_content
+
+    def test_missing_provenance_is_catchable(self, tmp_path: Path) -> None:
+        """Part 3 (provenance regression): a block with empty source_rationales
+        must NOT show any 'Source rationales used:' header for that outlier.
+
+        This test catches a writer that emits a provenance section even when
+        source_rationales is empty — or that silently drops the section when
+        it is populated (regression in the other direction is caught by
+        test_provenance_source_persona_present above).
+        """
+        # Build blocks where OUTLIER_B has no source rationales.
+        blocks = _make_counterargument_blocks()
+        # Confirm OUTLIER_B block has empty source_rationales.
+        assert blocks[_OUTLIER_B].source_rationales == []
+
+        thresholds = _make_thresholds_yaml(tmp_path)
+        capture = _make_round1_capture()
+        path = write_round1_transcript(
+            capture,
+            _make_consensus(),
+            _make_std_devs(),
+            "panel_approved",
+            week_id=WEEK_ID,
+            state_root=tmp_path / "state",
+            thresholds_path=thresholds,
+        )
+        append_round2_transcript(
+            path,
+            dissent_result=_make_dissent_result(),
+            outliers=_make_outlier_selection(),
+            counterargument_blocks=blocks,
+            round2_replies=_make_round2_replies(),
+            resynthesis_result=_make_resynthesis_result(),
+        )
+        content = path.read_text(encoding="utf-8")
+        # The OUTLIER_B section exists (heading present) but has no source rationales line.
+        assert f"#### {_OUTLIER_B}" in content
+        # Count occurrences of 'Source rationales used:' — should be exactly 1 (for OUTLIER_A only).
+        assert content.count("Source rationales used:") == 1
+
+    # Part 4 — Round-2 responses
+    def test_round2_responses_section_present(self, r2_content: str) -> None:
+        """Part 4: ### Round-2 Responses section + both outlier headings."""
+        assert "### Round-2 Responses" in r2_content
+        assert f"#### {_OUTLIER_A}" in r2_content
+        assert f"#### {_OUTLIER_B}" in r2_content
+
+    def test_rebuttal_narrative_present(self, r2_content: str) -> None:
+        """Part 4: rebuttal_narrative text appears for each outlier."""
+        assert "I acknowledge the leverage concern but maintain conviction on FCF." in r2_content
+        assert "The panel's macro view is compelling; revising to hold." in r2_content
+
+    # Part 5 — Consensus shift
+    def test_consensus_shift_section_present(self, r2_content: str) -> None:
+        """Part 5: ### Consensus Shift section heading is present."""
+        assert "### Consensus Shift" in r2_content
+
+    def test_consensus_shift_shows_r1_and_r2_deltas(self, r2_content: str) -> None:
+        """Part 5: both R1 provisional and post-R2 final weights appear in the table.
+
+        The table must show the side-by-side comparison so the founder can see
+        exactly which tickers moved and by how much.
+        """
+        # Provisional MSFT = 0.10 → "0.1000"; final MSFT = 0.08 → "0.0800"
+        assert "0.1000" in r2_content
+        assert "0.0800" in r2_content
+        # Delta for MSFT = -0.02 → "-0.0200"
+        assert "-0.0200" in r2_content
+
+    # Structural integrity
+    def test_round1_section_preserved_after_append(self, r2_content: str) -> None:
+        """R1 section must survive the append — Round-2 must not replace Round-1."""
+        assert "## Round 1" in r2_content
+
+    def test_anchor_replaced_not_duplicated(self, r2_content: str) -> None:
+        """The ROUND-2-INSERT-POINT anchor must be absent after append."""
+        assert "<!-- ROUND-2-INSERT-POINT -->" not in r2_content
+
+    def test_parts_in_order(self, r2_content: str) -> None:
+        """All 5 parts appear in order: Dissent Score → Outliers → Counterarguments
+        → Round-2 Responses → Consensus Shift."""
+        pos_dissent = r2_content.index("### Dissent Score")
+        pos_outliers = r2_content.index("### Selected Outliers")
+        pos_counter = r2_content.index("### Counterarguments")
+        pos_responses = r2_content.index("### Round-2 Responses")
+        pos_shift = r2_content.index("### Consensus Shift")
+        assert pos_dissent < pos_outliers < pos_counter < pos_responses < pos_shift, (
+            "Round-2 sections are not in the required order: "
+            "Dissent Score → Outliers → Counterarguments → Round-2 Responses → Consensus Shift"
+        )

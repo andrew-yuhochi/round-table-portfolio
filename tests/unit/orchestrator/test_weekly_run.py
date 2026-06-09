@@ -538,51 +538,134 @@ class TestTransactionalRollback:
 
 
 # ---------------------------------------------------------------------------
-# AC #3 — No Round-2 dispatch is reachable in M2
+# AC #2 (M3 inversion) — Round-2 IS wired; the dispatch seam fires exactly 2×
 # ---------------------------------------------------------------------------
 
-class TestNoRound2:
-    """AC #3: The orchestrator source contains no Round-2 dispatch path."""
+class TestRound2Present:
+    """AC #2 (M3): Round-2 phase is wired; the seam fires exactly 2 dispatches
+    and writes round=2 stances.  Replaces the M2 TestNoRound2 class.
 
-    def test_no_round2_dispatch_in_source(self) -> None:
-        """Inspect the weekly_run module source for any Round-2 dispatch call.
+    The stub dispatcher counts calls and returns canned round=2 JSON so no
+    live subagent is needed.
+    """
 
-        "round=2" legitimately appears in SQL that writes round=1 agent_stances
-        rows (the column is named 'round') and in comment text.  What we must
-        not find is a *dispatch* function call that would invoke Round 2 logic —
-        function names that would only exist if Round-2 code were wired in.
-        """
-        from round_table_portfolio.orchestrator import weekly_run as wr_module
-        source = inspect.getsource(wr_module)
+    @staticmethod
+    def _make_canned_round2_dispatcher(
+        call_log: list[str],
+        debate_set: list[str],
+    ):
+        """Return a dispatcher stub that logs calls and returns valid round=2 JSON."""
+        import json as _json
 
-        # These function-call patterns would indicate an actual Round-2 dispatch.
-        # Simple column references ("round=2" in SQL, comments) are permitted.
-        forbidden_call_patterns = [
-            "dispatch_round2(",
-            "capture_round2(",
-            "capture_round_2(",
-            "run_round2(",
-            "run_round_2(",
-            "round_two(",
-        ]
-        violations = [p for p in forbidden_call_patterns if p.lower() in source.lower()]
-        assert not violations, (
-            f"Round-2 dispatch call found in weekly_run source — M2 scope violation. "
-            f"Patterns found: {violations}"
-        )
+        def _dispatcher(outlier_slug: str, counterargument_block: str) -> str:
+            call_log.append(outlier_slug)
+            stances = [
+                {
+                    "ticker": t,
+                    "action": "HOLD",
+                    "target_weight": 0.0,
+                    "confidence": 3,
+                    "rationale": f"{outlier_slug} defends position on {t}",
+                    "position_change": "defended",
+                }
+                for t in debate_set
+            ]
+            return _json.dumps({
+                "round": 2,
+                "rebuttal_narrative": f"{outlier_slug} rebuttal narrative for testing.",
+                "stances": stances,
+            })
+        return _dispatcher
 
-    def test_no_round2_stances_in_db(
+    def test_round2_dispatcher_called_exactly_twice(
         self,
         run_env: dict,
         persona_replies: dict,
         week_id: str,
     ) -> None:
+        """The seam fires exactly 2 times — one per outlier (cost contract)."""
+        call_log: list[str] = []
+
+        # Build a temporary run to get the debate set for the canned dispatcher.
+        # We pass a None dispatcher first to get the debate_set from the result,
+        # then re-run with the real dispatcher.  Simpler: use a lazy dispatcher.
+        import json as _json
+
+        stances_cache: dict = {}
+
+        def _dispatcher(outlier_slug: str, counterargument_block: str) -> str:
+            call_log.append(outlier_slug)
+            # Use 3 tickers so stances are valid.
+            stances = [
+                {
+                    "ticker": "AAPL",
+                    "action": "HOLD",
+                    "target_weight": 0.0,
+                    "confidence": 3,
+                    "rationale": f"{outlier_slug} defends AAPL.",
+                    "position_change": "defended",
+                },
+                {
+                    "ticker": "MSFT",
+                    "action": "HOLD",
+                    "target_weight": 0.0,
+                    "confidence": 3,
+                    "rationale": f"{outlier_slug} defends MSFT.",
+                    "position_change": "defended",
+                },
+            ]
+            return _json.dumps({
+                "round": 2,
+                "rebuttal_narrative": f"{outlier_slug} rebuttal for AC test.",
+                "stances": stances,
+            })
+
         run_weekly(
             "round-table-portfolio",
             week_id=week_id,
             persona_replies=persona_replies,
             founder_reply="approve",
             judge=StubOnMandateJudge(),
+            round2_dispatcher=_dispatcher,
+            **run_env,
+        )
+        assert len(call_log) == 2, (
+            f"Expected exactly 2 Round-2 dispatch calls (cost contract), "
+            f"got {len(call_log)}: {call_log}"
+        )
+
+    def test_round2_stances_written_to_db(
+        self,
+        run_env: dict,
+        persona_replies: dict,
+        week_id: str,
+    ) -> None:
+        """round=2 stances exist after a run with the seam wired."""
+        import json as _json
+
+        def _dispatcher(outlier_slug: str, _cb: str) -> str:
+            return _json.dumps({
+                "round": 2,
+                "rebuttal_narrative": f"{outlier_slug} stub rebuttal.",
+                "stances": [
+                    {
+                        "ticker": "AAPL",
+                        "action": "HOLD",
+                        "target_weight": 0.0,
+                        "confidence": 3,
+                        "rationale": f"{outlier_slug} holds AAPL.",
+                        "position_change": "defended",
+                    }
+                ],
+            })
+
+        run_weekly(
+            "round-table-portfolio",
+            week_id=week_id,
+            persona_replies=persona_replies,
+            founder_reply="approve",
+            judge=StubOnMandateJudge(),
+            round2_dispatcher=_dispatcher,
             **run_env,
         )
         db = run_env["db_path"]
@@ -592,7 +675,71 @@ class TestNoRound2:
             (week_id,),
         ).fetchone()[0]
         conn.close()
-        assert round2 == 0, f"Round-2 stances must not exist in M2, got {round2}"
+        assert round2 > 0, (
+            f"Expected round=2 stances after M3 wiring, got 0. "
+            "The Round-2 dispatch seam is not producing DB rows."
+        )
+
+    def test_round2_stances_from_exactly_2_outliers(
+        self,
+        run_env: dict,
+        persona_replies: dict,
+        week_id: str,
+    ) -> None:
+        """Exactly 2 distinct personas have round=2 stances."""
+        import json as _json
+
+        def _dispatcher(outlier_slug: str, _cb: str) -> str:
+            return _json.dumps({
+                "round": 2,
+                "rebuttal_narrative": f"{outlier_slug} stub rebuttal.",
+                "stances": [
+                    {
+                        "ticker": "AAPL",
+                        "action": "HOLD",
+                        "target_weight": 0.0,
+                        "confidence": 3,
+                        "rationale": f"{outlier_slug} holds AAPL.",
+                        "position_change": "defended",
+                    }
+                ],
+            })
+
+        run_weekly(
+            "round-table-portfolio",
+            week_id=week_id,
+            persona_replies=persona_replies,
+            founder_reply="approve",
+            judge=StubOnMandateJudge(),
+            round2_dispatcher=_dispatcher,
+            **run_env,
+        )
+        db = run_env["db_path"]
+        conn = sqlite3.connect(str(db))
+        r2_personas = [
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT persona FROM agent_stances WHERE week_id=? AND round=2",
+                (week_id,),
+            ).fetchall()
+        ]
+        conn.close()
+        assert len(r2_personas) == 2, (
+            f"Expected exactly 2 personas with round=2 stances, got {len(r2_personas)}: "
+            f"{r2_personas}"
+        )
+
+    def test_capture_round2_import_present_in_source(self) -> None:
+        """The M3 seam symbols are present in weekly_run source (positive guard)."""
+        from round_table_portfolio.orchestrator import weekly_run as wr_module
+        source = inspect.getsource(wr_module)
+        assert "capture_round2_stances" in source, (
+            "weekly_run.py does not import/call 'capture_round2_stances' — "
+            "Round-2 wiring is missing."
+        )
+        assert "round2_dispatcher" in source, (
+            "weekly_run.py does not reference 'round2_dispatcher' — "
+            "the Round-2 dispatch seam is absent."
+        )
 
 
 # ---------------------------------------------------------------------------

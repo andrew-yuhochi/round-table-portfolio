@@ -34,9 +34,16 @@ Coverage matrix:
     test_run_log_appends_not_overwrites              — second call appends, does not wipe prior content
     test_report_object_returned                      — return value is a RunMetricsReport instance
 
+  DEF-003 — full-cycle total sums all 4 phases; verdict uses full total (M3 gap coverage):
+    test_full_cycle_total_equals_sum_of_all_phases   — total == research + round1 + judges + round2 (exact)
+    test_per_phase_fields_match_inputs               — research/round1/judges/round2 totals match input sums
+    test_verdict_uses_full_total_not_research_only   — verdict is TIGHT/DOES-NOT-FIT when full total crosses
+                                                        but research-only would say FITS
+    test_backward_compat_research_only               — omitting 3 new maps still works, total = research only
+
   AC5 — full test suite passes (no failures).
 
-Sample count: ≥25 cells across 23 tests.
+Sample count: ≥29 cells across 27 tests.
 """
 
 from __future__ import annotations
@@ -530,3 +537,136 @@ def test_report_object_returned(tmp_log: Path) -> None:
     )
     assert isinstance(result, RunMetricsReport)
     assert result.summary_text != ""
+
+
+# ---------------------------------------------------------------------------
+# DEF-003 — full-cycle total sums all 4 phases; verdict uses full total
+# ---------------------------------------------------------------------------
+
+# Representative per-phase timing maps used across DEF-003 tests.
+# Research: 2 200s (fits alone)
+# Round-1:  3 600s
+# Judges:   1 800s
+# Round-2:  1 500s
+# Full total: 9 100s → 9100/18000 = 50.6% → "tight" band (60–80% = tight, but 50.6 < 60 → fits)
+# Use larger values to push into tight/does-not-fit for the verdict test.
+
+_R1_TIMING = {"value": 550.0, "growth": 500.0, "discretionary-macro": 500.0,
+              "cta-systematic-macro": 500.0, "technical": 500.0, "quant-systematic": 500.0,
+              "risk-officer": 550.0}  # sum = 3 600s
+_JUDGE_TIMING = {"value": 270.0, "growth": 255.0, "discretionary-macro": 255.0,
+                 "cta-systematic-macro": 255.0, "technical": 255.0, "quant-systematic": 255.0,
+                 "risk-officer": 255.0}  # sum = 1 800s
+_R2_TIMING = {"growth": 780.0, "cta-systematic-macro": 720.0}  # sum = 1 500s
+
+_RESEARCH_TOTAL = sum(_TIMING_FITS.values())    # 2 200.0
+_R1_TOTAL       = sum(_R1_TIMING.values())      # 3 600.0
+_JUDGE_TOTAL    = sum(_JUDGE_TIMING.values())   # 1 800.0
+_R2_TOTAL       = sum(_R2_TIMING.values())      # 1 500.0
+_FULL_TOTAL     = _RESEARCH_TOTAL + _R1_TOTAL + _JUDGE_TOTAL + _R2_TOTAL  # 9 100.0
+
+# For the verdict-uses-full-total test: research-only = 2 200s → 12% → FITS,
+# but we need the FULL total to cross into TIGHT (≥60%) or DOES-NOT-FIT (≥80%).
+# Build timing maps where research-only would say FITS but full total is TIGHT.
+# Research: 2 200s (12% — FITS alone)
+# Round-1:  5 400s, Judges: 2 700s, Round-2: 900s → full = 11 200s → 62.2% → TIGHT
+_R1_TIMING_VERDICT = {slug: 5400.0 / len(_PERSONA_SLUGS) for slug in _PERSONA_SLUGS}
+_JUDGE_TIMING_VERDICT = {slug: 2700.0 / len(_PERSONA_SLUGS) for slug in _PERSONA_SLUGS}
+_R2_TIMING_VERDICT = {"growth": 450.0, "cta-systematic-macro": 450.0}  # sum = 900s
+_FULL_TOTAL_VERDICT = (
+    sum(_TIMING_FITS.values())
+    + sum(_R1_TIMING_VERDICT.values())
+    + sum(_JUDGE_TIMING_VERDICT.values())
+    + sum(_R2_TIMING_VERDICT.values())
+)  # 2200 + 5400 + 2700 + 900 = 11 200s → 62.2% → tight
+
+
+class TestFullCycleMetrics:
+    """DEF-003: total_wall_seconds sums all 4 phases; verdict computed against full total."""
+
+    def test_full_cycle_total_equals_sum_of_all_phases(self, tmp_log: Path) -> None:
+        """DEF-003 AC1: total_wall_seconds == research + round1 + judges + round2 (exact arithmetic)."""
+        report = report_run_metrics(
+            per_persona_timing=_TIMING_FITS,
+            per_round1_timing=_R1_TIMING,
+            per_judge_timing=_JUDGE_TIMING,
+            per_round2_timing=_R2_TIMING,
+            research_results=_make_results_all_within_budget(),
+            budgets=_make_budgets(),
+            window_config=_window_config(),
+            run_log_path=tmp_log,
+        )
+        expected_total = _RESEARCH_TOTAL + _R1_TOTAL + _JUDGE_TOTAL + _R2_TOTAL
+        assert report.total_wall_seconds == pytest.approx(expected_total, abs=1e-6), (
+            f"total_wall_seconds {report.total_wall_seconds} != expected {expected_total}"
+        )
+
+    def test_per_phase_fields_match_inputs(self, tmp_log: Path) -> None:
+        """DEF-003 AC2: per-phase breakdown fields equal their respective input sums."""
+        report = report_run_metrics(
+            per_persona_timing=_TIMING_FITS,
+            per_round1_timing=_R1_TIMING,
+            per_judge_timing=_JUDGE_TIMING,
+            per_round2_timing=_R2_TIMING,
+            research_results=_make_results_all_within_budget(),
+            budgets=_make_budgets(),
+            window_config=_window_config(),
+            run_log_path=tmp_log,
+        )
+        assert report.research_total_seconds == pytest.approx(_RESEARCH_TOTAL, abs=1e-6)
+        assert report.round1_total_seconds   == pytest.approx(_R1_TOTAL,       abs=1e-6)
+        assert report.judges_total_seconds   == pytest.approx(_JUDGE_TOTAL,    abs=1e-6)
+        assert report.round2_total_seconds   == pytest.approx(_R2_TOTAL,       abs=1e-6)
+
+    def test_verdict_uses_full_total_not_research_only(self, tmp_path: Path) -> None:
+        """DEF-003 AC3 (the critical case): research-only total says FITS, but full-cycle
+        total is in the TIGHT band.  The verdict must reflect the full total.
+
+        A regression that computes the verdict against research-only would return
+        'fits' here — this test catches that regression.
+        """
+        log = tmp_path / "runs" / "2026-W26.log"
+        # Verify research-only would say FITS (<60% of window).
+        research_only_fraction = sum(_TIMING_FITS.values()) / _WINDOW_SECONDS
+        assert research_only_fraction < 0.60, (
+            "Precondition: research-only fraction must be < 60% (FITS) for this test to be meaningful"
+        )
+
+        report = report_run_metrics(
+            per_persona_timing=_TIMING_FITS,
+            per_round1_timing=_R1_TIMING_VERDICT,
+            per_judge_timing=_JUDGE_TIMING_VERDICT,
+            per_round2_timing=_R2_TIMING_VERDICT,
+            research_results=_make_results_all_within_budget(),
+            budgets=_make_budgets(),
+            window_config=_window_config(),
+            run_log_path=log,
+        )
+
+        # Full total must be in the tight band (60–80%) → verdict must NOT be "fits".
+        full_fraction = _FULL_TOTAL_VERDICT / _WINDOW_SECONDS
+        assert 0.60 <= full_fraction < _PROXIMITY_THRESHOLD, (
+            f"Precondition: full fraction {full_fraction:.3f} must be in tight band [0.60, {_PROXIMITY_THRESHOLD})"
+        )
+        assert report.feasibility_verdict in ("tight", "does-not-fit"), (
+            f"Expected 'tight' or 'does-not-fit' but got '{report.feasibility_verdict}'. "
+            "Verdict appears to use research-only total instead of full-cycle total (DEF-003 regression)."
+        )
+        assert report.window_fraction == pytest.approx(full_fraction, abs=1e-6), (
+            "window_fraction must be computed from the full-cycle total, not research-only."
+        )
+
+    def test_backward_compat_research_only(self, tmp_log: Path) -> None:
+        """DEF-003 backward compat: omitting the 3 new maps still works; total == research only."""
+        report = report_run_metrics(
+            per_persona_timing=_TIMING_FITS,
+            # per_round1_timing, per_judge_timing, per_round2_timing all default to None
+            research_results=_make_results_all_within_budget(),
+            budgets=_make_budgets(),
+            window_config=_window_config(),
+            run_log_path=tmp_log,
+        )
+        assert report.total_wall_seconds == pytest.approx(_RESEARCH_TOTAL, abs=1e-6)
+        assert report.round1_total_seconds == pytest.approx(0.0, abs=1e-6)
+        assert report.judges_total_seconds == pytest.approx(0.0, abs=1e-6)
+        assert report.round2_total_seconds == pytest.approx(0.0, abs=1e-6)

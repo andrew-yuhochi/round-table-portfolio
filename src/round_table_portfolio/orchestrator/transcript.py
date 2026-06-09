@@ -1,9 +1,13 @@
-"""Component 17 — Round-1 transcript persistence.
+"""Component 17 — Round-1 + Round-2 transcript persistence.
 
-Public entry point::
+Public entry points::
 
-    from round_table_portfolio.orchestrator.transcript import write_round1_transcript
+    from round_table_portfolio.orchestrator.transcript import (
+        write_round1_transcript,
+        append_round2_transcript,
+    )
 
+    # Step 1 (before ledger write — FILE-FIRST CONTRACT):
     transcript_path = write_round1_transcript(
         round1_capture,
         consensus_weights,
@@ -11,6 +15,16 @@ Public entry point::
         decision_type,
         week_id="2026-W23",
         state_root=Path("state"),
+    )
+
+    # Step 2 (M3 — after Round-2 data is ready, still before ledger commit):
+    append_round2_transcript(
+        transcript_path,
+        dissent_result=dissent_result,
+        outliers=outliers,
+        counterargument_blocks=counterargument_blocks,
+        round2_replies=round2_replies,
+        resynthesis_result=resynthesis_result,
     )
 
 FILE-FIRST CONTRACT
@@ -27,9 +41,10 @@ prior transcript at the target path intact — no partial file at the target.
 
 M3-APPEND CONTRACT
 ------------------
-The markdown structure uses a clear ``## Round 1`` heading so M3 can append a
-``## Round 2`` section without reformatting.  The M2 scope boundary is enforced
-by the absence of any Round-2 content — asserted in the test suite.
+The markdown structure uses a clear ``## Round 1`` heading followed by the
+``<!-- ROUND-2-INSERT-POINT -->`` anchor.  ``append_round2_transcript`` reads the
+existing file, replaces that anchor with a full ``## Round 2`` section, and
+atomically rewrites the file.  The Round-1 content is never reformatted.
 """
 
 from __future__ import annotations
@@ -156,6 +171,234 @@ def write_round1_transcript(
     )
 
     return target_path
+
+
+# ---------------------------------------------------------------------------
+# Round-2 append (M3 — Component 17 M3 change)
+# ---------------------------------------------------------------------------
+
+
+def append_round2_transcript(
+    transcript_path: Path,
+    *,
+    dissent_result: Any,
+    outliers: Any,
+    counterargument_blocks: dict[str, Any],
+    round2_replies: dict[str, Any],
+    resynthesis_result: Any,
+) -> None:
+    """Append the Round-2 section to an existing Round-1 transcript file.
+
+    Reads the file, replaces the ``<!-- ROUND-2-INSERT-POINT -->`` anchor with
+    a full ``## Round 2`` section, and atomically rewrites the file.  The
+    Round-1 section is left untouched.
+
+    The Round-2 section records (in order per TDD Component 17 M3 change):
+      1. Recalibrated dissent score + whether it crossed the contested threshold
+         (Component 21 output — ``dissent_result``).
+      2. The 2 selected outlier personas + their divergence scores (Component 22
+         output — ``outliers``).
+      3. The assembled counterargument for each outlier, quoting which opposing
+         personas' Round-1 rationales it was built from (Component 23 output —
+         ``counterargument_blocks``; provenance is required per TDD).
+      4. Each outlier's defend-OR-revise response + rebuttal narrative (Component
+         24 output — ``round2_replies``, each a ``Round2Reply`` object).
+      5. The consensus SHIFT — R1 provisional delta vs post-R2 final delta side
+         by side (Component 25 output — ``resynthesis_result``).
+
+    Args:
+        transcript_path:       Path to the existing Round-1 transcript file.
+        dissent_result:        ``DissentResult`` from Component 21.
+        outliers:              ``OutlierSelection`` from Component 22.
+        counterargument_blocks: Dict[persona_slug, ``CounterargumentBlock``] from
+                               Component 23.
+        round2_replies:        Dict[persona_slug, ``Round2Reply``] from Component 24.
+        resynthesis_result:    ``ResynthesisResult`` from Component 25.
+
+    Raises:
+        FileNotFoundError: If ``transcript_path`` does not exist.
+        OSError:           On atomic-write failure.
+    """
+    existing = transcript_path.read_text(encoding="utf-8")
+
+    round2_section = _render_round2_section(
+        dissent_result=dissent_result,
+        outliers=outliers,
+        counterargument_blocks=counterargument_blocks,
+        round2_replies=round2_replies,
+        resynthesis_result=resynthesis_result,
+    )
+
+    # Replace the anchor comment with the Round-2 section.
+    if "<!-- ROUND-2-INSERT-POINT -->" in existing:
+        updated = existing.replace(
+            "<!-- ROUND-2-INSERT-POINT -->",
+            round2_section,
+        )
+    else:
+        # Anchor missing — append at end (defensive; should not occur in normal flow).
+        logger.warning(
+            "Round-2 insert anchor not found in %s — appending at end.", transcript_path
+        )
+        updated = existing.rstrip("\n") + "\n\n" + round2_section
+
+    _atomic_write(transcript_path, updated)
+
+    logger.info(
+        "Round-2 section appended to transcript: %s  (%d outliers)",
+        transcript_path,
+        len(outliers.selected),
+    )
+
+
+def _render_round2_section(
+    *,
+    dissent_result: Any,
+    outliers: Any,
+    counterargument_blocks: dict[str, Any],
+    round2_replies: dict[str, Any],
+    resynthesis_result: Any,
+) -> str:
+    """Build the ``## Round 2`` markdown section.
+
+    Structure:
+        ## Round 2
+        ### Dissent Score
+        ### Selected Outliers
+        ### Counterarguments
+        #### <persona>
+            Source rationales (provenance) + assembled block
+        ### Round-2 Responses
+        #### <persona>
+            rebuttal_narrative + per-ticker stances with position_change
+        ### Consensus Shift
+    """
+    lines: list[str] = ["## Round 2", ""]
+
+    # ------------------------------------------------------------------
+    # 1. Dissent score
+    # ------------------------------------------------------------------
+    lines.append("### Dissent Score")
+    lines.append("")
+    lines.append(
+        f"**Recalibrated dissent score:** {dissent_result.dissent_score:.4f}  "
+        f"(contested threshold: 0.50)"
+    )
+    contested_flag = "YES — week marked as contested" if dissent_result.contested_week else "no"
+    lines.append(f"**Contested week:** {contested_flag}")
+    lines.append("")
+
+    # ------------------------------------------------------------------
+    # 2. Selected outliers
+    # ------------------------------------------------------------------
+    lines.append("### Selected Outliers (most-divergent personas)")
+    lines.append("")
+    lines.append("| Persona | Divergence Score |")
+    lines.append("|---------|-----------------|")
+    for slug in outliers.selected:
+        div_score = dissent_result.per_persona_divergence.get(slug, 0.0)
+        lines.append(f"| {slug} | {div_score:.4f} |")
+    lines.append("")
+
+    # ------------------------------------------------------------------
+    # 3. Counterarguments (provenance required — TDD ~line 1297)
+    # ------------------------------------------------------------------
+    lines.append("### Counterarguments (assembled from Round-1 rationales)")
+    lines.append("")
+    for slug in outliers.selected:
+        cb = counterargument_blocks.get(slug)
+        if cb is None:
+            lines.append(f"#### {slug}")
+            lines.append("_(no counterargument block available)_")
+            lines.append("")
+            continue
+        lines.append(f"#### {slug}")
+        lines.append("")
+        if cb.debated_tickers:
+            lines.append(f"**Challenged tickers:** {', '.join(cb.debated_tickers)}")
+            lines.append("")
+        # Provenance — list source rationales first.
+        if cb.source_rationales:
+            lines.append("**Source rationales used:**")
+            lines.append("")
+            for src_persona, src_ticker, src_text in cb.source_rationales:
+                # Truncate long rationales for readability.
+                excerpt = src_text[:200] + ("…" if len(src_text) > 200 else "")
+                excerpt = excerpt.replace("|", "\\|").replace("\n", " ")
+                lines.append(f"- [{src_persona} on {src_ticker}]: {excerpt}")
+            lines.append("")
+        lines.append("**Assembled counterargument block:**")
+        lines.append("")
+        if cb.block:
+            # Indent as blockquote.
+            for bl_line in cb.block.splitlines():
+                lines.append(f"> {bl_line}" if bl_line.strip() else ">")
+        else:
+            lines.append("_(empty — no opposing rationales found)_")
+        lines.append("")
+
+    # ------------------------------------------------------------------
+    # 4. Round-2 responses
+    # ------------------------------------------------------------------
+    lines.append("### Round-2 Responses")
+    lines.append("")
+    for slug in outliers.selected:
+        reply = round2_replies.get(slug)
+        if reply is None:
+            lines.append(f"#### {slug}")
+            lines.append("_(no Round-2 reply available)_")
+            lines.append("")
+            continue
+        lines.append(f"#### {slug}")
+        lines.append("")
+        lines.append(f"**Rebuttal narrative:** {reply.rebuttal_narrative}")
+        lines.append("")
+        if reply.stances:
+            lines.append("| Ticker | Action | Weight | Conf | Position Change | Rationale |")
+            lines.append("|--------|--------|--------|------|-----------------|-----------|")
+            for s in sorted(reply.stances, key=lambda x: x.ticker):
+                rat = s.rationale.replace("|", "\\|").replace("\n", " ")[:120]
+                lines.append(
+                    f"| {s.ticker} | {s.action} | {s.target_weight:.4f} "
+                    f"| {s.confidence} | {s.position_change} | {rat} |"
+                )
+        lines.append("")
+
+    # ------------------------------------------------------------------
+    # 5. Consensus shift
+    # ------------------------------------------------------------------
+    lines.append("### Consensus Shift (R1 provisional → post-R2 final)")
+    lines.append("")
+    prov = resynthesis_result.provisional_weights
+    final = resynthesis_result.final_weights
+    delta = resynthesis_result.delta
+
+    # All tickers across both dicts.
+    all_tickers = sorted(set(prov) | set(final))
+    lines.append("| Ticker | R1 Provisional | Post-R2 Final | Δ |")
+    lines.append("|--------|---------------|--------------|---|")
+    for ticker in all_tickers:
+        p = prov.get(ticker, 0.0)
+        f = final.get(ticker, 0.0)
+        d = delta.get(ticker, 0.0)
+        d_str = f"{d:+.4f}" if abs(d) > 1e-9 else "—"
+        lines.append(f"| {ticker} | {p:.4f} | {f:.4f} | {d_str} |")
+    lines.append("")
+
+    moved = [t for t in all_tickers if abs(delta.get(t, 0.0)) > 1e-9]
+    if moved:
+        lines.append(
+            f"**Tickers with weight change ({len(moved)}):** "
+            + ", ".join(
+                f"{t} ({delta[t]:+.4f})"
+                for t in sorted(moved, key=lambda x: -abs(delta[x]))
+            )
+        )
+    else:
+        lines.append("**No weight changes** — outliers defended all positions.")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

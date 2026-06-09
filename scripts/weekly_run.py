@@ -12,72 +12,56 @@ The Claude session:
   4. Dispatches the output-validator-judge subagent per persona, parses with
      parse_judge_response, and writes the verdicts to
      state/runs/<week>.judge_verdicts.json
-  5. Records per-persona wall-clock timing to
-     state/runs/<week>.timing.json
-  6. Calls this driver in preview mode to review the proposed consensus before
+  5. Records per-persona + per-phase wall-clock timing to
+     state/runs/<week>.timing.json        (research phase)
+     state/runs/<week>.round1_timing.json (Round-1 dispatch phase)
+     state/runs/<week>.judge_timing.json  (judge dispatch phase)
+  6. Calls this driver in prepare-round2 mode to receive the 2 outlier slugs
+     and counterargument blocks printed to stdout, then dispatches those 2
+     outlier subagents and writes their replies to
+     state/runs/<week>.round2_replies.json:
+       python scripts/weekly_run.py --mode prepare-round2 --week 2026-W23
+  7. Calls this driver in preview mode to review the proposed consensus before
      committing:
        python scripts/weekly_run.py --mode preview [--week 2026-W23]
-  7. Reviews the preview output, then commits with the founder reply:
+  8. Reviews the preview output, then commits with the founder reply:
        python scripts/weekly_run.py --mode commit --founder-reply "approve"
 
 Modes
 -----
 prepare-round1 — Reads state/runs/<week>.persona_replies.json and computes the
-           debate set using the SAME logic as the commit run.  Writes
-           state/runs/<week>.debate_set.json containing the ordered ticker list
-           and a per-persona digest so the session can inject each persona's
-           own research into its Round-1 prompt.  Prints the debate set, the
-           max_position_weight cap, the action vocabulary, and the required
-           Round-1 reply schema so the session has the contract in front of it.
-           WRITES NOTHING into the real state/ (uses a temp state_root
-           internally so run_persona_research side-effects are isolated).
+           debate set.  Writes state/runs/<week>.debate_set.json.
 
-preview  — Runs the full engine against a THROWAWAY temp ledger (real state is
-           NOT touched).  Prints + writes state/runs/<week>.preview.md.
-           Uses founder_reply="approve" so the transactional write path is
-           exercised, but on a temp DB.
+prepare-round2 — Reads state/runs/<week>.persona_replies.json +
+           state/runs/<week>.round1_replies.json and runs steps 6a–6c
+           (dissent → outlier selection → counterargument assembly) deterministically.
+           Prints the 2 outlier slugs + their counterargument blocks so the session
+           can dispatch the Round-2 subagents.  Writes nothing to state/.
+
+preview  — Runs the full engine (including Round-2 with stubbed replies if
+           state/runs/<week>.round2_replies.json exists) against a THROWAWAY
+           temp ledger.  Prints + writes state/runs/<week>.preview.md.
 
 commit   — Runs the full engine against the REAL state/ledger.db with the
-           supplied --founder-reply.  Prints the completion summary.
+           supplied --founder-reply.
 
 Input files (produced by the session before calling this driver)
 ---------------------------------------------------------------
-state/runs/<week>.persona_replies.json
-    {
-      "<slug>": "<raw RESEARCH OUTPUT SCHEMA JSON string>",
-      ...
-    }   (7 entries)
-
-state/runs/<week>.round1_replies.json        [not needed for prepare-round1]
-    {
-      "<slug>": "<raw ROUND 1 OUTPUT SCHEMA JSON string>",
-      ...
-    }   (7 entries)
-
-state/runs/<week>.judge_verdicts.json        [not needed for prepare-round1]
-    {
-      "<slug>": {"passed": true|false, "justification": "<text>"},
-      ...
-    }   (7 entries)
-
-state/runs/<week>.timing.json                [not needed for prepare-round1]
-    {
-      "<slug>": <wall_clock_seconds as float>,
-      ...
-    }   (7 entries)
+state/runs/<week>.persona_replies.json        (7 entries — research phase)
+state/runs/<week>.round1_replies.json         (7 entries — Round-1 phase)
+state/runs/<week>.judge_verdicts.json         (7 entries — judge verdicts)
+state/runs/<week>.timing.json                 (7 entries — research wall-clock)
+state/runs/<week>.round1_timing.json          (7 entries — Round-1 wall-clock, optional)
+state/runs/<week>.judge_timing.json           (7 entries — judge wall-clock, optional)
+state/runs/<week>.round2_replies.json         (2 entries — Round-2 outlier replies, optional)
+state/runs/<week>.round2_timing.json          (2 entries — Round-2 wall-clock, optional)
 
 Output file written by prepare-round1
 --------------------------------------
 state/runs/<week>.debate_set.json
     {
-      "debate_set": ["AAPL", "MSFT", ...],   // ordered, de-duplicated
-      "persona_digest": {
-        "<slug>": {
-          "shortlist": ["AAPL", ...],         // directly-shortlisted tickers only
-          "report_excerpt": "<first ~400 chars of that persona's report>"
-        },
-        ...
-      }
+      "debate_set": ["AAPL", "MSFT", ...],
+      "persona_digest": { "<slug>": {"shortlist": [...], "report_excerpt": "..."}, ... }
     }
 """
 
@@ -113,6 +97,8 @@ from round_table_portfolio.budget.loader import get_budget, load_budgets
 from round_table_portfolio.personas.output_validator import load_validator_config
 from round_table_portfolio.research.runner import run_persona_research
 from round_table_portfolio.orchestrator.round1 import construct_debate_set
+from round_table_portfolio.orchestrator.counterargument import load_counterargument_config
+from round_table_portfolio.orchestrator.round2 import parse_round2_reply
 
 # ---------------------------------------------------------------------------
 # Default week
@@ -153,6 +139,23 @@ def _load_timing(week: str, state_root: Path) -> dict[str, float]:
     path = state_root / "runs" / f"{week}.timing.json"
     raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     return {slug: float(t) for slug, t in raw.items()}
+
+
+def _load_timing_optional(week: str, state_root: Path, suffix: str) -> dict[str, float]:
+    """Load a timing JSON file if it exists, returning {} otherwise."""
+    path = state_root / "runs" / f"{week}.{suffix}.json"
+    if not path.exists():
+        return {}
+    raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return {slug: float(t) for slug, t in raw.items()}
+
+
+def _load_round2_replies_optional(week: str, state_root: Path) -> dict[str, str]:
+    """Load round2_replies.json if it exists, returning {} otherwise."""
+    path = state_root / "runs" / f"{week}.round2_replies.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +318,164 @@ def run_prepare_round1(week: str, state_root: Path) -> None:
     for slug, digest in persona_digest.items():
         tickers_str = ", ".join(digest["shortlist"]) if digest["shortlist"] else "(empty)"
         print(f"    {slug:<28} {tickers_str}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Prepare-round2 mode (M3 — prints outliers + counterarguments)
+# ---------------------------------------------------------------------------
+
+
+def run_prepare_round2(week: str, state_root: Path) -> None:
+    """Run steps 6a–6c deterministically and print the Round-2 briefing.
+
+    Reads persona_replies + round1_replies, runs the full engine up through
+    counterargument assembly (all free Python — no dispatch), then prints:
+      - The 2 selected outlier slugs + their divergence scores.
+      - Each outlier's assembled counterargument block (verbatim quotes from
+        opposing personas' Round-1 rationales).
+
+    The session uses this output to dispatch the 2 Round-2 outlier subagents,
+    capture their replies, and write state/runs/<week>.round2_replies.json.
+
+    WRITES NOTHING to state/ — this is a read + print mode only.
+    """
+    import yaml
+    from round_table_portfolio.orchestrator.dissent import (
+        compute_dissent,
+        load_dissent_config,
+        select_outliers,
+    )
+    from round_table_portfolio.orchestrator.counterargument import (
+        assemble_counterarguments,
+        load_counterargument_config,
+    )
+
+    persona_replies = _load_persona_replies(week, state_root)
+    round1_replies = _load_round1_replies(week, state_root)
+
+    budget_config = _PROJECT_ROOT / "config" / "persona_budgets.yaml"
+    thresholds_config = _PROJECT_ROOT / "config" / "thresholds.yaml"
+    validator_config_path = _PROJECT_ROOT / "config" / "validator.yaml"
+
+    budget_raw = yaml.safe_load(budget_config.read_text(encoding="utf-8")) or {}
+    thresholds = yaml.safe_load(thresholds_config.read_text(encoding="utf-8")) or {}
+    max_position_weight: float = float(thresholds.get("max_position_weight", 0.20))
+
+    budgets = load_budgets(budget_config)
+    v_config = load_validator_config(validator_config_path)
+    judge = StubOnMandateJudge()
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="rtp_r2prep_"))
+    try:
+        tmp_state = tmp_dir / "state"
+        tmp_state.mkdir()
+
+        persona_results = []
+        for slug in _PERSONA_SLUGS:
+            raw = persona_replies.get(slug)
+            if not raw:
+                raise RuntimeError(
+                    f"prepare-round2: no persona reply for slug={slug!r}."
+                )
+            budget = get_budget(budgets, slug)
+            result = run_persona_research(
+                persona_slug=slug,
+                week_id=week,
+                raw_output=raw,
+                mandate="",
+                judge=judge,
+                budget=budget,
+                validator_config=v_config,
+                state_root=tmp_state,
+            )
+            persona_results.append(result)
+
+        debate_cfg: dict = {
+            "debate_set_ceiling": budget_raw.get("debate_set_ceiling", 40),
+            "max_position_weight": max_position_weight,
+        }
+        debate_set = construct_debate_set(persona_results, debate_cfg)
+
+        from round_table_portfolio.orchestrator.round1 import capture_round1_stances
+        from round_table_portfolio.personas.output_validator import validate_counterfactual_portfolio
+
+        _r1_replies: dict[str, str] = round1_replies or persona_replies or {}
+        round1 = capture_round1_stances(
+            debate_set,
+            persona_results,
+            raw_round1_replies=_r1_replies,
+            config={"max_position_weight": max_position_weight},
+        )
+
+        # 6a. Dissent
+        dissent_cfg = load_dissent_config(thresholds_config)
+        dissent_result = compute_dissent(round1.stances, debate_set, dissent_cfg)
+
+        # 6b. Outlier selection
+        outliers = select_outliers(dissent_result, round1.stances, dissent_cfg)
+
+        # Collect R1 rationales for Component 23.
+        r1_rationales: dict[str, dict[str, str]] = {}
+        for s in round1.stances:
+            p = s.persona; t = s.ticker; r = s.rationale
+            r1_rationales.setdefault(p, {})[t] = r
+
+        # 6c. Counterargument assembly
+        ca_cfg = load_counterargument_config(thresholds_config)
+        counterargument_blocks = assemble_counterarguments(
+            outlier_slugs=outliers.selected,
+            all_stances=round1.stances,
+            rationales=r1_rationales,
+            config=ca_cfg,
+        )
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
+
+    # Print the Round-2 briefing.
+    print(f"\n{'='*62}")
+    print(f"  ROUND-2 BRIEFING — {week}")
+    print(f"{'='*62}")
+    print(f"  Dissent score: {dissent_result.dissent_score:.4f}  "
+          f"(contested={dissent_result.contested_week})")
+    print(f"  Selected outliers (2):")
+    for slug in outliers.selected:
+        div = dissent_result.per_persona_divergence.get(slug, 0.0)
+        print(f"    {slug:<30}  divergence={div:.4f}")
+    print()
+    print("  COUNTERARGUMENT BLOCKS (verbatim — source Round-1 rationales):")
+    print()
+    for slug in outliers.selected:
+        cb = counterargument_blocks[slug]
+        print(f"  --- {slug} ---")
+        print(f"  Challenged tickers: {', '.join(cb.debated_tickers)}")
+        print(f"  Source rationales used ({len(cb.source_rationales)}):")
+        for src_persona, src_ticker, _ in cb.source_rationales:
+            print(f"    [{src_persona} on {src_ticker}]")
+        print()
+        print("  Counterargument block (paste into Round-2 prompt):")
+        print("  " + "\n  ".join(cb.block.splitlines()))
+        print()
+
+    print("  ROUND-2 OUTPUT SCHEMA (required from each outlier):")
+    print("  {")
+    print('    "round": 2,')
+    print('    "rebuttal_narrative": "<how you responded to the counterargument>",')
+    print('    "stances": [')
+    print('      {')
+    print('        "ticker":          "<one ticker from the debate set>",')
+    print('        "action":          "ADD" | "REDUCE" | "HOLD" | "EXIT",')
+    print(f'        "target_weight":   <float 0.0 – {max_position_weight}>,')
+    print('        "confidence":      <int 1–5>,')
+    print('        "rationale":       "<strengthened or revised rationale>",')
+    print('        "position_change": "defended" | "revised"')
+    print('      },')
+    print(f'      ...  // restate stances for tickers where you respond to the counterargument')
+    print('    ]')
+    print("  }")
+    print()
+    print(f"  Write replies to: state/runs/{week}.round2_replies.json")
+    print(f"  Write timing  to: state/runs/{week}.round2_timing.json")
     print()
 
 
@@ -544,6 +705,39 @@ def _render_preview(data: _PreviewData) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Round-2 dispatcher factory
+# ---------------------------------------------------------------------------
+
+
+def _make_round2_dispatcher(
+    round2_replies_raw: dict[str, str],
+) -> Any:
+    """Build a round2_dispatcher callable from pre-captured reply strings.
+
+    The returned callable mirrors the live-session dispatch seam:
+        (outlier_slug: str, counterargument_block: str) -> str (raw JSON)
+
+    In the driver (preview + commit), the session has already captured the
+    2 outlier replies and written them to round2_replies.json.  This factory
+    replays them in order so run_weekly receives the canned JSON without a
+    live dispatch.
+
+    Only the outlier_slug argument is used for lookup; counterargument_block
+    is accepted but ignored (the session already used it when dispatching).
+    """
+    def _dispatcher(outlier_slug: str, counterargument_block: str) -> str:
+        raw = round2_replies_raw.get(outlier_slug)
+        if raw is None:
+            raise KeyError(
+                f"round2_dispatcher: no pre-captured reply for slug={outlier_slug!r}. "
+                f"Available: {sorted(round2_replies_raw)}. "
+                "Check state/runs/<week>.round2_replies.json."
+            )
+        return raw
+    return _dispatcher
+
+
+# ---------------------------------------------------------------------------
 # Preview mode
 # ---------------------------------------------------------------------------
 
@@ -554,8 +748,15 @@ def run_preview(week: str, state_root: Path) -> None:
     round1_replies = _load_round1_replies(week, state_root)
     judge_verdicts = _load_judge_verdicts(week, state_root)
     session_timing = _load_timing(week, state_root)
+    round1_timing = _load_timing_optional(week, state_root, "round1_timing")
+    judge_timing = _load_timing_optional(week, state_root, "judge_timing")
+    round2_replies_raw = _load_round2_replies_optional(week, state_root)
+    round2_timing = _load_timing_optional(week, state_root, "round2_timing")
 
     judge = ReplayJudge(judge_verdicts)
+
+    # Build the round2_dispatcher from pre-captured replies (replay pattern).
+    _r2_dispatcher = _make_round2_dispatcher(round2_replies_raw) if round2_replies_raw else None
 
     # Build a temp directory for the throwaway run.
     tmp_dir = Path(tempfile.mkdtemp(prefix="rtp_preview_"))
@@ -566,8 +767,6 @@ def run_preview(week: str, state_root: Path) -> None:
         tmp_db = tmp_dir / "ledger.db"
         apply_schema(db_path=tmp_db)
 
-        # Seed real persona memory files into the temp state so writeback_memory
-        # finds them.  We copy (not move) so real memory is untouched.
         real_memory_dir = state_root / "memory"
         tmp_memory_dir = tmp_state / "memory"
         if real_memory_dir.exists():
@@ -582,6 +781,9 @@ def run_preview(week: str, state_root: Path) -> None:
             round1_replies=round1_replies,
             founder_reply="approve",
             judge=judge,
+            round2_dispatcher=_r2_dispatcher,
+            per_round1_timing=round1_timing,
+            per_judge_timing=judge_timing,
             personas_config=_PROJECT_ROOT / "config" / "personas.yaml",
             budget_config=_PROJECT_ROOT / "config" / "persona_budgets.yaml",
             thresholds_config=_PROJECT_ROOT / "config" / "thresholds.yaml",
@@ -595,16 +797,13 @@ def run_preview(week: str, state_root: Path) -> None:
             result, tmp_db, week, session_timing
         )
     finally:
-        # Always clean up temp directory.
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
     if preview_data is None:
-        # run_weekly raised; nothing to render.
         return
 
     preview_text = _render_preview(preview_data)
 
-    # Write preview file.
     preview_path = state_root / "runs" / f"{week}.preview.md"
     preview_path.parent.mkdir(parents=True, exist_ok=True)
     preview_path.write_text(preview_text, encoding="utf-8")
@@ -624,9 +823,12 @@ def run_commit(week: str, founder_reply: str, state_root: Path) -> None:
     round1_replies = _load_round1_replies(week, state_root)
     judge_verdicts = _load_judge_verdicts(week, state_root)
     timing = _load_timing(week, state_root)
+    round1_timing = _load_timing_optional(week, state_root, "round1_timing")
+    judge_timing = _load_timing_optional(week, state_root, "judge_timing")
+    round2_replies_raw = _load_round2_replies_optional(week, state_root)
+    _round2_dispatcher = _make_round2_dispatcher(round2_replies_raw) if round2_replies_raw else None
 
     judge = ReplayJudge(judge_verdicts)
-
     real_db = state_root / "ledger.db"
 
     result = run_weekly(
@@ -636,6 +838,9 @@ def run_commit(week: str, founder_reply: str, state_root: Path) -> None:
         round1_replies=round1_replies,
         founder_reply=founder_reply,
         judge=judge,
+        round2_dispatcher=_round2_dispatcher,
+        per_round1_timing=round1_timing,
+        per_judge_timing=judge_timing,
         personas_config=_PROJECT_ROOT / "config" / "personas.yaml",
         budget_config=_PROJECT_ROOT / "config" / "persona_budgets.yaml",
         thresholds_config=_PROJECT_ROOT / "config" / "thresholds.yaml",
@@ -664,11 +869,20 @@ def run_commit(week: str, founder_reply: str, state_root: Path) -> None:
     if result.decision_delta:
         print(f"  Delta:             {result.decision_delta}")
     print(f"  Portfolios:        {result.num_portfolios_written} (1 consensus + 7 counterfactual)")
-    print(f"  Stances:           {result.num_stances_written}")
+    print(f"  Round-1 stances:   {result.num_stances_written}")
+    print(f"  Round-2 stances:   {result.num_round2_stances} (2 outliers)")
     print(f"  Persona reports:   {result.num_persona_reports}")
     print(f"  Transcript:        {result.transcript_path}")
     print(f"  Memory updates:    {len(memory_files)}/7")
     print(f"  Validator claims:  {len(claim_files)}/7")
+    if result.resynthesis and result.resynthesis.delta:
+        moved = sorted(
+            result.resynthesis.delta.items(), key=lambda x: -abs(x[1])
+        )
+        delta_str = ", ".join(f"{t} ({d:+.4f})" for t, d in moved[:5])
+        print(f"  Consensus shift:   {delta_str}")
+    else:
+        print(f"  Consensus shift:   none (outliers defended all positions)")
     print()
 
     if result.metrics:
@@ -717,13 +931,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["prepare-round1", "preview", "commit"],
+        choices=["prepare-round1", "prepare-round2", "preview", "commit"],
         required=True,
         help=(
             "prepare-round1: compute debate set from persona_replies and write "
             "debate_set.json (no real state side-effects).  "
-            "preview: throwaway run against a temp ledger, prints founder-readable "
-            "summary.  commit: real run against state/ledger.db."
+            "prepare-round2: run dissent + outlier selection + counterargument "
+            "assembly deterministically, printing the 2 outlier slugs and their "
+            "counterargument blocks so the session can dispatch Round-2.  "
+            "preview: throwaway run (incl. Round-2 if round2_replies.json exists), "
+            "prints founder-readable summary.  "
+            "commit: real run against state/ledger.db."
         ),
     )
     parser.add_argument(
@@ -747,6 +965,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.mode == "prepare-round1":
         run_prepare_round1(args.week, state_root)
+    elif args.mode == "prepare-round2":
+        run_prepare_round2(args.week, state_root)
     elif args.mode == "preview":
         run_preview(args.week, state_root)
     elif args.mode == "commit":
