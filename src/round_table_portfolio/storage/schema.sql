@@ -163,6 +163,28 @@ CREATE TABLE IF NOT EXISTS persona_shortlists (
 );
 
 -- ============================================================
+-- Per-stock counterfactual price snapshots (additive — M5, 2026-06-09)
+-- One row per shortlisted/debate-set ticker per weekly run.
+-- Captures EVERY surfaced stock (accepted AND rejected) for the
+-- "what we passed on" performance curve.
+-- NOTE: no enhancement_version FK — a price snapshot is a market fact,
+--       not a decision-version-dependent artefact (ALIGNMENT-LOG 2026-06-09).
+-- NOTE: no FK to persona_shortlists — the surfaced-by join is recovered at
+--       read time (Component 39) so tracking persists beyond shortlist lifetime.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS shortlist_price_snapshots (
+    snapshot_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    week_id         TEXT    NOT NULL REFERENCES weeks(week_id),
+    ticker          TEXT    NOT NULL,
+    snapshot_date   TEXT    NOT NULL,   -- actual price date returned by Alpaca (may lag run_date by 1 trading day)
+    price           REAL    NOT NULL CHECK(price > 0),
+    roster_version  INTEGER NOT NULL REFERENCES roster_versions(roster_version),
+    user_id         TEXT    NOT NULL DEFAULT 'andrew',
+    UNIQUE(week_id, ticker, user_id)
+);
+
+-- ============================================================
 -- Seed data: PoC initial lookup rows
 -- INSERT OR IGNORE so apply_schema.py is idempotent on re-runs.
 -- ============================================================
