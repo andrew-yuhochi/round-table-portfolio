@@ -1007,6 +1007,16 @@ def run_commit(week: str, founder_reply: str, state_root: Path) -> None:
         print(f"  Consensus shift:   {delta_str}")
     else:
         print(f"  Consensus shift:   none (outliers defended all positions)")
+
+    # M5 Component 38: post-commit snapshot capture summary.
+    if result.capture_summary:
+        cs = result.capture_summary
+        miss_note = f" (missed: {cs.missed_tickers})" if cs.missed_tickers else ""
+        print(
+            f"  Snapshots:         {cs.success_count} written "
+            f"({cs.newly_entered_count} new + {cs.still_tracking_count} continuing)"
+            f" | {cs.miss_count} Alpaca miss{miss_note}"
+        )
     print()
 
     if result.metrics:

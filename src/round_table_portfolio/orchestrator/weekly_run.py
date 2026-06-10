@@ -26,7 +26,7 @@ Engine / session split (TDD §1.1)
   post-dispatch work: parse → validate → debate-set → Round-1 stances →
   Round-2 (2 outlier dispatches via injected ``round2_dispatcher``) →
   re-synthesis → consensus → ledger write → transcript → memory write-back →
-  metrics.
+  snapshot capture → metrics.
 - In tests, inject canned ``persona_replies`` + a ``StubOnMandateJudge`` +
   a stub ``round2_dispatcher`` returning canned JSON + set ``STUB_ALLOW=1``.
   No live subagent is spawned.
@@ -162,6 +162,12 @@ from round_table_portfolio.orchestrator.briefing_builder import (
 from round_table_portfolio.orchestrator.metrics import (
     RunMetricsReport,    # noqa: F401 — shape used by tests
     report_run_metrics,
+)
+
+# Component 38 — real implementation (TASK-M5-001 + TASK-M5-003 wiring).
+from round_table_portfolio.orchestrator.snapshot_capture import (
+    CaptureSummary,
+    capture_shortlist_snapshots,
 )
 
 # All sibling-task stubs have now been replaced by real implementations.
@@ -542,6 +548,9 @@ class WeeklyRunResult:
     # M4: per-persona briefing results from step-0 read-before-dispatch.
     # Empty dict on first week (cold-start) or when memory dir has no files yet.
     briefings: dict[str, BriefingResult] = field(default_factory=dict)
+    # M5 Component 38: summary of the post-commit snapshot capture step.
+    # None only when the capture step was skipped (e.g. no shortlist tickers).
+    capture_summary: Optional[CaptureSummary] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1075,7 +1084,42 @@ def run_weekly(
     )
 
     # ------------------------------------------------------------------
-    # 10. Metrics — Component 19 (M3 DEF-003: full-cycle timing).
+    # 10. Per-stock snapshot capture — Component 38 (TASK-M5-003).
+    #     POST-COMMIT step: runs only after the ledger commit succeeded.
+    #     Unreachable on any rolled-back path — the transaction block above
+    #     re-raises on failure, so execution only arrives here on success.
+    #     Opens a fresh connection (the ledger conn was closed in the finally
+    #     block above) and commits its own rows atomically.
+    #     Shortlist tickers = union of all persona shortlist_rows for this week.
+    #     roster_version = taken from the first available shortlist row.
+    # ------------------------------------------------------------------
+    _shortlist_tickers: list[str] = [
+        row.ticker
+        for res in persona_results
+        for row in res.shortlist_rows
+    ]
+    _roster_version: int = 1  # default (roster_versions table seeds row 1)
+    for _res in persona_results:
+        if _res.shortlist_rows:
+            _roster_version = _res.shortlist_rows[0].roster_version
+            break
+
+    _capture_conn = sqlite3.connect(str(_db))
+    _capture_conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        _capture_summary = capture_shortlist_snapshots(
+            conn=_capture_conn,
+            week_id=week_label,
+            shortlist_tickers=_shortlist_tickers,
+            debate_set_tickers=list(debate_set),
+            roster_version=_roster_version,
+            user_id=user_id,
+        )
+    finally:
+        _capture_conn.close()
+
+    # ------------------------------------------------------------------
+    # 11. Metrics — Component 19 (M3 DEF-003: full-cycle timing).
     #     Passes all 4 timing maps so the total covers research + R1 + judges
     #     + Round-2.  run_log_path is written with a summary preamble first;
     #     report_run_metrics appends the full report below it.
@@ -1121,4 +1165,5 @@ def run_weekly(
         provisional_weights=provisional_weights,
         persona_results=persona_results,
         briefings=_briefings,
+        capture_summary=_capture_summary,
     )
