@@ -13,6 +13,10 @@ Covers:
     6. no-ignore-clause in RESEARCH MANDATE
     7. missing explicit `"CASH"` entry in ROUND 1 counterfactual_portfolio
        (Layer 1 of the three-layer fully-invested rule — TASK-M2-001)
+    8. missing HOLDING HORIZON section (TASK-M6-002)
+    9. thin / one-line HOLDING HORIZON clause (TASK-M6-002)
+    10. HOLDING HORIZON present + long enough but omits thesis-change-not-price-move
+        principle (TASK-M6-002)
 """
 
 from __future__ import annotations
@@ -52,6 +56,18 @@ _RESEARCH_MANDATE = (
     "momentum and narrative hype — if a name is up 80% on a story, that is a reason for "
     "caution, not interest. Use fundamentals and filings via the data tools; use web "
     "search only for recent context."
+)
+
+_HOLDING_HORIZON = (
+    "You invest on a **medium-term, 3-month-to-2-year horizon** — the months and "
+    "quarters it takes the market to recognize value and close the gap to intrinsic "
+    "worth (a re-rating, a balance-sheet repair, a cash-flow inflection, a catalyst "
+    "finally arriving). Closing that gap is slow by nature, and patience is the price "
+    "of admission to your edge; you do not expect, or chase, a quick move.\n\n"
+    "Your exits are driven by the **thesis, not the tape**. You EXIT or REDUCE a name "
+    "when the medium-term value case is impaired — the margin of safety has genuinely "
+    "eroded — not because the quote fell this week. A single week's price move is never "
+    "by itself a reason to sell."
 )
 
 _RESEARCH_ACCESS = (
@@ -136,6 +152,7 @@ _FRONTMATTER = (
 _BODY_SECTIONS: dict[str, str] = {
     "MANDATE": _MANDATE,
     "RESEARCH MANDATE": _RESEARCH_MANDATE,
+    "HOLDING HORIZON": _HOLDING_HORIZON,
     "RESEARCH ACCESS": _RESEARCH_ACCESS,
     "ALLOWED ACTIONS": _ALLOWED_ACTIONS,
     "MEMORY": _MEMORY,
@@ -184,8 +201,8 @@ def test_built_conforming_persona_passes(tmp_path: Path) -> None:
     assert result.name == "value"
 
 
-def test_required_sections_constant_has_eight() -> None:
-    assert len(REQUIRED_SECTIONS) == 8
+def test_required_sections_constant_has_nine() -> None:
+    assert len(REQUIRED_SECTIONS) == 9
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +331,47 @@ def test_fixture_stale_round2_schema_fails(tmp_path: Path) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# HOLDING HORIZON deliberate-failure fixtures (TASK-M6-002)
+# ---------------------------------------------------------------------------
+
+def test_fixture_missing_holding_horizon_fails(tmp_path: Path) -> None:
+    """Fixture 8 — HOLDING HORIZON section absent entirely."""
+    p = _write(tmp_path, _build_persona(drop="HOLDING HORIZON"))
+    result = validate_persona_definition(p)
+    assert not result.ok
+    assert any("HOLDING HORIZON" in v for v in result.violations)
+
+
+def test_fixture_thin_holding_horizon_fails(tmp_path: Path) -> None:
+    """Fixture 9 — HOLDING HORIZON present but a one-line blanket placeholder."""
+    secs = dict(_BODY_SECTIONS)
+    secs["HOLDING HORIZON"] = "Hold names for the medium term."
+    p = _write(tmp_path, _build_persona(sections=secs))
+    result = validate_persona_definition(p)
+    assert not result.ok
+    assert any("HOLDING HORIZON" in v and "thin" in v for v in result.violations)
+
+
+def test_fixture_horizon_missing_thesis_principle_fails(tmp_path: Path) -> None:
+    """Fixture 10 — HOLDING HORIZON names the 3mo-2yr band but omits the
+    thesis-change-not-price-move exit principle.
+    """
+    secs = dict(_BODY_SECTIONS)
+    secs["HOLDING HORIZON"] = (
+        "You invest on a 3-month-to-2-year medium-term horizon. This is the window "
+        "in which value re-ratings, balance-sheet repairs, and cash-flow inflections "
+        "play out. Patience is the price of admission to your edge. You do not expect "
+        "a quick move and you size positions to reflect that companies take quarters "
+        "to re-rate. Stay focused on the fundamentals and re-evaluate each week with "
+        "fresh data from filings and web searches."
+    )
+    p = _write(tmp_path, _build_persona(sections=secs))
+    result = validate_persona_definition(p)
+    assert not result.ok
+    assert any("thesis" in v.lower() or "principle" in v.lower() for v in result.violations)
+
+
 def test_missing_file_fails() -> None:
     result = validate_persona_definition(Path("/nonexistent/persona.md"))
     assert not result.ok
@@ -337,6 +395,10 @@ def test_fixtures_written_to_disk() -> None:
         "fail_websearch_absent.md",
         "fail_missing_cash_clause.md",
         "fail_stale_round2_schema.md",
+        # M6-002 horizon-clause failure fixtures
+        "fail_missing_holding_horizon.md",
+        "fail_thin_holding_horizon.md",
+        "fail_horizon_no_thesis_principle.md",
     }
     present = {p.name for p in fdir.glob("*.md")}
     assert expected.issubset(present), f"Missing on-disk fixtures: {expected - present}"

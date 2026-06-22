@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 REQUIRED_SECTIONS: tuple[str, ...] = (
     "MANDATE",
     "RESEARCH MANDATE",
+    "HOLDING HORIZON",
     "RESEARCH ACCESS",
     "ALLOWED ACTIONS",
     "MEMORY",
@@ -45,8 +46,34 @@ REQUIRED_TOOLS: tuple[str, ...] = ("Bash", "WebSearch")
 # guards against thin one-line placeholders. The mandate is the moat.
 MIN_SUBSTANTIVE_CHARS = 120
 
+# Minimum substantive length (chars) for the HOLDING HORIZON body — guards against
+# one-line blanket stubs like "hold for the medium term". The per-archetype clause
+# must be specific enough to convey WHY this persona's horizon works the way it does.
+MIN_HORIZON_CHARS = 150
+
 # Words that signal the explicit "ignore" clause required in RESEARCH MANDATE.
 _IGNORE_WORDS = ("ignore", "ignores", "avoid", "avoids", "exclude", "excludes", "do not", "does not")
+
+# Terms that must appear in HOLDING HORIZON to confirm (a) the 3mo–2yr band is named
+# and (b) the thesis-change-not-price-move principle is stated.
+# Check (a): at least one of these must appear in the section text (case-insensitive).
+_HORIZON_BAND_TERMS = ("3-month", "3 month", "2-year", "2 year", "medium-term", "medium term")
+# Check (b): the clause must contain a thesis-change or anti-price-move signal.
+# Covers the full range of per-archetype voices: value/growth use "thesis" + "price move";
+# cta/quant/technical use "price move" or "rationale must"; risk-officer uses "tape"
+# and "rationale must" (its principle is "driven by risk picture, not the weekly tape").
+_HORIZON_THESIS_TERMS = (
+    "thesis",
+    "price move",
+    "price-move",
+    "price action",
+    "not because",
+    "not a price",
+    "not on a price",
+    "not on price",
+    "rationale must",
+    "tape",
+)
 
 
 @dataclass
@@ -159,6 +186,35 @@ def validate_persona_definition(path: str | Path) -> PersonaValidationResult:
                 "`## RESEARCH MANDATE` has no explicit ignore/avoid/exclude clause; "
                 "the 'what it ignores' clause is what makes the persona distinguishable."
             )
+
+    # --- HOLDING HORIZON substantive (M6-002) -----------------------------
+    # The section-presence check fires above (REQUIRED_SECTIONS). Here we
+    # enforce: (1) non-trivial length — blanket one-liners fail; (2) the
+    # 3mo–2yr band is named — confirms the medium-term window is explicit;
+    # (3) the thesis-change-not-price-move principle appears — confirms the
+    # exit discipline is stated. All three are deterministic text checks; no
+    # LLM dispatch (Critical Component #3).
+    hh = sections.get("HOLDING HORIZON", "")
+    if "HOLDING HORIZON" in {s.upper() for s in sections} or hh:
+        hh_lower = hh.lower()
+        if hh and len(hh) < MIN_HORIZON_CHARS:
+            violations.append(
+                f"`## HOLDING HORIZON` is too thin ({len(hh)} chars < {MIN_HORIZON_CHARS}); "
+                "author an archetype-specific clause — a blanket one-liner fails."
+            )
+        else:
+            if hh and not any(t in hh_lower for t in _HORIZON_BAND_TERMS):
+                violations.append(
+                    "`## HOLDING HORIZON` does not reference the 3-month-to-2-year band; "
+                    "the medium-term window must be explicitly named (e.g. '3-month', '2-year', "
+                    "'medium-term')."
+                )
+            if hh and not any(t in hh_lower for t in _HORIZON_THESIS_TERMS):
+                violations.append(
+                    "`## HOLDING HORIZON` omits the thesis-change-not-price-move principle; "
+                    "the clause must state that an EXIT/REDUCE/ADD is driven by a change in "
+                    "the medium-term thesis, not by a price move."
+                )
 
     # --- ALLOWED ACTIONS must not contain SHORT ---------------------------
     actions = sections.get("ALLOWED ACTIONS", "")

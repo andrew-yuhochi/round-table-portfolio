@@ -16,6 +16,9 @@ build/
 # SQLite ledger and all runtime state — local-only, never committed
 state/
 
+# State backup tarballs — local-only, never committed
+state-backup-*.tar.gz
+
 # Config files with real values (only *.example.yaml are committed)
 config/*.yaml
 config/*.toml
