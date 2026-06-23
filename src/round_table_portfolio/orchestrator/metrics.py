@@ -25,6 +25,8 @@ Usage::
         budgets=budgets,
         window_config={"window_hours": 5.0, "window_proximity_threshold": 0.80},
         run_log_path=Path("state/runs/2026-W23.log"),
+        prior_holdings={"AAPL": 0.10, "CASH": 0.05, ...},
+        new_holdings={"MSFT": 0.12, "CASH": 0.0, ...},
     )
     print(metrics.summary_text)
 
@@ -41,6 +43,14 @@ Design notes (M3 update — DEF-003 full-cycle timing):
     fits:       total run < 60% of window
     tight:      60% <= total run < proximity_threshold of window
     does-not-fit: total run >= proximity_threshold of window
+
+M6 Component 19 extension — consensus one-way turnover:
+- compute_consensus_turnover(prior, new) → TurnoverResult
+  Formula: 0.5 · Σ_i |w_i,new − w_i,old| over the UNION of both books.
+  CASH is included as a ticker; absent ticker → weight 0.
+  First week (prior={}) → turnover_pct=None (N/A).
+- Surfaced in BOTH the weekly preview (summary_text) and the run log.
+- METRIC ONLY — no tripwire, no threshold that alters the run.
 """
 
 from __future__ import annotations
@@ -56,6 +66,106 @@ from round_table_portfolio.budget.loader import PersonaBudget, get_budget
 from round_table_portfolio.research.runner import PersonaResearchResult
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# M6 — Consensus one-way turnover (Component 19 extension)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TurnoverResult:
+    """Result of compute_consensus_turnover.
+
+    ``turnover_pct``  — one-way turnover as a percentage [0, 100], or None
+                        when prior_holdings is empty (first-ever week → N/A).
+    ``n_added``       — count of tickers added (in new, not old / old weight = 0).
+    ``n_removed``     — count of tickers removed (in old, not new / new weight = 0).
+    ``n_reweighted``  — count of tickers in both books whose weight changed.
+    ``preview_line``  — one-line founder-facing string ready for the weekly preview.
+    ``log_line``      — one-line string for the run log.
+    """
+
+    turnover_pct: Optional[float]
+    n_added: int
+    n_removed: int
+    n_reweighted: int
+    preview_line: str
+    log_line: str
+
+
+def compute_consensus_turnover(
+    prior_holdings: dict[str, float],
+    new_holdings: dict[str, float],
+) -> TurnoverResult:
+    """Compute the consensus one-way turnover between two consecutive books.
+
+    Formula: ``0.5 · Σ_i |w_i,new − w_i,old|`` over the UNION of both ticker
+    sets.  A ticker absent from one book has weight 0 there.  CASH is included
+    as a regular ticker so the CASH 24%→0% move in W24→W25 contributes.
+
+    The 0.5 factor makes the result ONE-WAY: a complete portfolio swap (sell
+    everything, buy a new set) reads 100%, not 200%.
+
+    Args:
+        prior_holdings: ticker → weight for the prior-week consensus book.
+                        Pass {} to signal first-ever week (returns N/A).
+        new_holdings:   ticker → weight for this week's consensus book.
+
+    Returns:
+        TurnoverResult with turnover_pct=None when prior_holdings is empty.
+    """
+    if not prior_holdings:
+        line = "Consensus turnover vs last week: N/A (no prior book — first week)"
+        return TurnoverResult(
+            turnover_pct=None,
+            n_added=0,
+            n_removed=0,
+            n_reweighted=0,
+            preview_line=line,
+            log_line=line,
+        )
+
+    all_tickers = set(prior_holdings.keys()) | set(new_holdings.keys())
+
+    total_abs_diff = sum(
+        abs(new_holdings.get(t, 0.0) - prior_holdings.get(t, 0.0))
+        for t in all_tickers
+    )
+    turnover = 0.5 * total_abs_diff
+    turnover_pct = turnover * 100.0
+
+    # Breakdown: added / removed / re-weighted (non-zero weight transition).
+    n_added = sum(
+        1 for t in all_tickers
+        if prior_holdings.get(t, 0.0) == 0.0 and new_holdings.get(t, 0.0) > 0.0
+    )
+    n_removed = sum(
+        1 for t in all_tickers
+        if prior_holdings.get(t, 0.0) > 0.0 and new_holdings.get(t, 0.0) == 0.0
+    )
+    n_reweighted = sum(
+        1 for t in all_tickers
+        if prior_holdings.get(t, 0.0) > 0.0
+        and new_holdings.get(t, 0.0) > 0.0
+        and abs(new_holdings[t] - prior_holdings[t]) > 1e-9
+    )
+
+    body = (
+        f"{turnover_pct:.1f}% "
+        f"(added {n_added}, removed {n_removed}, re-weighted {n_reweighted})"
+    )
+    preview_line = f"Consensus turnover vs last week: {body}"
+    log_line = f"consensus_turnover={body}"
+
+    return TurnoverResult(
+        turnover_pct=turnover_pct,
+        n_added=n_added,
+        n_removed=n_removed,
+        n_reweighted=n_reweighted,
+        preview_line=preview_line,
+        log_line=log_line,
+    )
 
 # Default thresholds — overridden by window_config at call time.
 _DEFAULT_WINDOW_HOURS = 5.0
@@ -94,6 +204,9 @@ class RunMetricsReport:
     M3 change (DEF-003): total_wall_seconds is now the SUM of ALL phases
     (research + round1 + judges + round2), not research-only.  The per-phase
     breakdown fields let the founder see where time is spent.
+
+    M6 Component 19 extension: turnover field carries the consensus one-way
+    turnover result (None when not supplied — backward-compatible callers).
     """
     week_label: str
     total_wall_seconds: float
@@ -110,6 +223,8 @@ class RunMetricsReport:
     round1_total_seconds: float = 0.0
     judges_total_seconds: float = 0.0
     round2_total_seconds: float = 0.0
+    # M6 — consensus one-way turnover (None when prior book unavailable).
+    turnover: Optional[TurnoverResult] = None
 
     # Convenience accessor matching the stub's field name so callers that
     # used RunMetrics.total_wall_seconds continue to work unchanged.
@@ -146,12 +261,15 @@ def _build_summary_text(
     round1_total_seconds: float = 0.0,
     judges_total_seconds: float = 0.0,
     round2_total_seconds: float = 0.0,
+    turnover: Optional[TurnoverResult] = None,
 ) -> str:
     """Assemble the human-readable summary for session output.
 
     M3 DEF-003: total includes all phases; per-phase breakdown is printed so
     the founder sees where time is spent (research vs. Round 1 vs. judges vs.
     Round 2).
+
+    M6: turnover line is inserted after the verdict line when supplied.
     """
     window_pct = window_fraction * 100.0
     duration_str = _fmt_duration(total_wall_seconds)
@@ -165,6 +283,10 @@ def _build_summary_text(
         f"  Total run:     {duration_str}  ({window_pct:.0f}% of the {window_label} window)",
         f"  Verdict:       {feasibility_verdict.upper()}",
     ]
+
+    # M6 — consensus turnover line (METRIC ONLY — no tripwire).
+    if turnover is not None:
+        lines.append(f"  {turnover.preview_line}")
 
     # Per-phase breakdown — only print phases that consumed non-zero time.
     phase_breakdown: list[str] = []
@@ -247,6 +369,8 @@ def report_run_metrics(
     per_round1_timing: Optional[dict[str, float]] = None,
     per_judge_timing: Optional[dict[str, float]] = None,
     per_round2_timing: Optional[dict[str, float]] = None,
+    prior_holdings: Optional[dict[str, float]] = None,
+    new_holdings: Optional[dict[str, float]] = None,
 ) -> RunMetricsReport:
     """Measure and report run-time + per-persona web-search/tool counts.
 
@@ -355,6 +479,11 @@ def report_run_metrics(
     # Derive week_label from the run log path stem (e.g. "2026-W23").
     week_label = run_log_path.stem
 
+    # M6 — compute consensus one-way turnover when holdings are supplied.
+    turnover: Optional[TurnoverResult] = None
+    if prior_holdings is not None and new_holdings is not None:
+        turnover = compute_consensus_turnover(prior_holdings, new_holdings)
+
     summary_text = _build_summary_text(
         week_label=week_label,
         total_wall_seconds=total_wall_seconds,
@@ -369,6 +498,7 @@ def report_run_metrics(
         round1_total_seconds=round1_total,
         judges_total_seconds=judges_total,
         round2_total_seconds=round2_total,
+        turnover=turnover,
     )
 
     report = RunMetricsReport(
@@ -386,14 +516,17 @@ def report_run_metrics(
         round1_total_seconds=round1_total,
         judges_total_seconds=judges_total,
         round2_total_seconds=round2_total,
+        turnover=turnover,
     )
 
     # Persist to run log — mkdir -p so state/runs/ does not need to pre-exist.
     run_log_path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # M6: include the turnover log_line in the persisted entry alongside the report.
+    turnover_line = f"\n{turnover.log_line}" if turnover is not None else ""
     log_entry = (
         f"\n--- run-metrics @ {timestamp} ---\n"
-        f"{summary_text}\n"
+        f"{summary_text}{turnover_line}\n"
     )
     with run_log_path.open("a", encoding="utf-8") as fh:
         fh.write(log_entry)

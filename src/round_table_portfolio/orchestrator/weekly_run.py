@@ -1173,6 +1173,8 @@ def run_weekly(
     # ------------------------------------------------------------------
     run_log_path = _state / "runs" / f"{week_label}.log"
     run_log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Preamble: key-value summary lines written BEFORE report_run_metrics appends.
+    # M6: consensus_prior_week is included so the turnover figure is anchored.
     run_log_path.write_text(
         f"week={week_label}\n"
         f"decision={decision_type}\n"
@@ -1181,9 +1183,14 @@ def run_weekly(
         f"stances={len(round1.stances)}\n"
         f"round2_stances={len(round2_stances_all)}\n"
         f"persona_reports={len(persona_results)}\n"
-        f"debate_set_size={len(debate_set)}\n",
+        f"debate_set_size={len(debate_set)}\n"
+        f"consensus_prior_week={_consensus_book.week_set or 'none'}\n",
         encoding="utf-8",
     )
+    # M6 Component 19: pass the prior (w_old) and new (w_new) consensus holdings
+    # so report_run_metrics can compute and surface the one-way turnover.
+    # prior = _consensus_book.holdings (loaded at step-0c; {} on first week → N/A).
+    # new   = final_weights (the post-Round-2 / provisional consensus for this week).
     metrics = report_run_metrics(
         per_persona_timing=per_persona_timing,
         research_results=persona_results,
@@ -1193,6 +1200,8 @@ def run_weekly(
         per_round1_timing=per_round1_timing or {},
         per_judge_timing=per_judge_timing or {},
         per_round2_timing=per_round2_timing,
+        prior_holdings=_consensus_book.holdings,
+        new_holdings=final_weights,
     )
 
     return WeeklyRunResult(
