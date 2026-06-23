@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "reactive-004",
+    "category": "reactive",
+    "persona": "quant-systematic",
+    "expected_label": "reactive",
+    "description": "Quant persona reduces SMCI citing momentum turning and weekly price decline — no medium-term factor model signal change stated.",
+    "provenance": "hand-authored 2026-06-22; quant persona language pattern — 'momentum turned' with no factor-loading context is a known reactive-churn signal for quant archetype"
+  },
+  "stances": [
+    {
+      "ticker": "SMCI",
+      "action": "reduce",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": "Momentum has turned negative. SMCI is down 14% over the past two weeks and relative strength vs. sector has deteriorated sharply. Reducing exposure."
+      }
+    }
+  ]
+}

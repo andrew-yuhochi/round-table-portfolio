@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "genuine-001",
+    "category": "genuine",
+    "persona": "value",
+    "expected_label": "genuine",
+    "description": "Value persona exits INTC citing two consecutive quarters of below-thesis FCF generation and gross-margin compression — structural earnings-power break.",
+    "provenance": "hand-authored 2026-06-22; INTC earnings-power decline is a well-documented public event; sanitised to remove any real-run context"
+  },
+  "stances": [
+    {
+      "ticker": "INTC",
+      "action": "exit",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": "The original thesis was predicated on Intel sustaining 55%+ gross margins and recovering FCF to $10B+ annually by 2025. Q1 and Q2 2025 gross margins came in at 41% and 39% respectively, and FCF has been negative for three consecutive quarters. The competitive moat in leading-edge foundry has not materialised — TSMC process-node leadership has widened, not narrowed. The earnings-power assumption that underpinned the valuation is structurally broken, not cyclically weak."
+      }
+    }
+  ]
+}

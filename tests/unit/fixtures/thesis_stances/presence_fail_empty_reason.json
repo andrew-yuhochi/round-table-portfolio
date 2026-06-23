@@ -1,0 +1,19 @@
+{
+  "_fixture_meta": {
+    "id": "presence-fail-002",
+    "category": "presence_gate",
+    "expected_gate_result": "FAIL",
+    "description": "REDUCE stance with thesis_status present but thesis_status.reason is an empty string — must fail the deterministic presence gate.",
+    "provenance": "hand-authored 2026-06-22; tests the empty-reason branch of _run_thesis_presence_gate"
+  },
+  "stances": [
+    {
+      "ticker": "AMZN",
+      "action": "reduce",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": ""
+      }
+    }
+  ]
+}

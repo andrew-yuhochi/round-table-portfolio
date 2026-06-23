@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "genuine-006",
+    "category": "genuine_add",
+    "persona": "discretionary-macro",
+    "expected_label": "genuine",
+    "description": "Discretionary-macro persona adds TLT citing a medium-term regime change thesis (Fed pivot + growth deceleration) — macro narrative, not price momentum.",
+    "provenance": "hand-authored 2026-06-22; uses publicly known macro narrative framework"
+  },
+  "stances": [
+    {
+      "ticker": "TLT",
+      "action": "add",
+      "thesis_status": {
+        "verdict": "new",
+        "reason": "Medium-term thesis: the Fed pivot thesis has now been confirmed by three sequential CPI prints below 3% and a manufacturing PMI that has contracted for four consecutive months. Historically, this combination has preceded a 200–300bp rally in 10-year yields within 12 months. The macro regime is shifting from 'higher for longer' to 'first cut priced' — TLT is the cleanest expression of duration exposure to a Fed normalisation cycle over the next 12–18 months."
+      }
+    }
+  ]
+}

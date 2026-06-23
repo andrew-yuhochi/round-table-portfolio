@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "reactive-002",
+    "category": "reactive",
+    "persona": "growth",
+    "expected_label": "reactive",
+    "description": "Growth persona exits ROKU citing stop being hit and underperformance vs. index — no change to medium-term revenue acceleration thesis.",
+    "provenance": "hand-authored 2026-06-22; pattern from W25 real run stance log where 'stop hit' language appeared in two growth exits"
+  },
+  "stances": [
+    {
+      "ticker": "ROKU",
+      "action": "exit",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": "Stop hit at -12% from entry. ROKU has underperformed the Nasdaq by 800bps over the past month. The risk/reward no longer justifies holding."
+      }
+    }
+  ]
+}

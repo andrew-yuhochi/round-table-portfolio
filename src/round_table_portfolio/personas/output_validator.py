@@ -16,6 +16,20 @@ Entry point::
         max_position_weight=0.20,
     )
 
+    # From M6-005: validate Round-1 stances (thesis-presence gate + genuine-vs-reactive
+    # judge). Called AFTER capture_round1_stances(), NOT in run_persona_research().
+    # Accepts the RAW judge response string (the same string the session captured once
+    # per persona for the on-mandate verdict) — no second judge dispatch.
+    from round_table_portfolio.personas.output_validator import validate_round1_stances
+    stance_result = validate_round1_stances(
+        stances=[{"ticker": "AAPL", "action": "exit", "thesis_status": {"verdict": "broken",
+                   "reason": "Growth rate structurally broke..."}}, ...],
+        persona_slug="value",
+        judge_raw_response=raw_judge_response_str,  # full raw string from the single judge call
+    )
+    # stance_result.notes contains per-stance REACTIVE flags (if any); passed=True always
+    # (reactive is flagged, not auto-blocked).
+
 The concrete on-mandate judge (``OnMandateJudge`` implementor) is wired at the
 orchestration layer (TASK-M1-010 runner), NOT inside this module.  This module
 exposes:
@@ -23,7 +37,11 @@ exposes:
 - ``OnMandateJudge``  — Protocol/interface that the orchestration layer implements
                         as a subagent dispatch.
 - ``StubOnMandateJudge`` — Deterministic stub for unit tests.
-- ``validate_persona_report`` — Composes structural gate + judge.
+- ``validate_persona_report`` — Composes structural gate + judge (research report).
+- ``validate_round1_stances`` — M6-005: thesis-presence gate + genuine-vs-reactive
+                                 classification for Round-1 stances (called post-Round-1).
+                                 Accepts the raw judge response string from the session's
+                                 ONE judge call — no second judge dispatch.
 
 This module does NOT write DB rows.  The research runner (TASK-M1-010) writes
 ``persona_reports.validator_passed`` and ``persona_reports.validator_notes``
@@ -112,6 +130,17 @@ def load_validator_config(config_path: Optional[Path] = None) -> ValidatorConfig
 STAGE_STRUCTURAL = "structural"
 STAGE_FULLY_INVESTED = "fully_invested"
 STAGE_LLM_JUDGE = "llm_judge"
+STAGE_THESIS_PRESENCE = "thesis_presence"  # M6-005 deterministic gate (Round-1 stances)
+STAGE_THESIS_REASONING = "thesis_reasoning"  # M6-005 genuine-vs-reactive judge
+
+# Actions that require a non-empty thesis_status.reason in the Round-1 output.
+# Must stay in sync with round1.py _THESIS_REQUIRED_ACTIONS (both are the
+# ground-truth for the EXIT/REDUCE/ADD contract).
+_THESIS_REQUIRED_ACTIONS: frozenset[str] = frozenset({"exit", "reduce", "add"})
+
+# The two labels the judge returns per stance; anything else is treated as unknown.
+THESIS_GENUINE = "genuine"
+THESIS_REACTIVE = "reactive"
 
 
 @dataclass
@@ -439,6 +468,47 @@ class StubOnMandateJudge:
         )
 
 
+class StubOnMandateJudgeWithThesis:
+    """Deterministic stub for M6-005 genuine-vs-reactive tests.
+
+    Accepts a mapping of ``persona_slug -> dict[ticker, "genuine"|"reactive"]``
+    and returns the per-stance labels in the THESIS_REASONING_START/END block
+    format that ``parse_judge_response_with_thesis`` expects.
+
+    This stub is only used for ``validate_round1_stances()`` tests — it should
+    NOT replace StubOnMandateJudge for existing report-validation tests.
+    """
+
+    def __init__(
+        self,
+        thesis_labels: dict[str, dict[str, str]],
+    ) -> None:
+        # thesis_labels: {persona_slug: {ticker: "genuine"|"reactive"}}
+        self._labels = thesis_labels
+
+    def judge(
+        self,
+        report: str,
+        mandate: str,
+        persona_slug: str,
+        on_mandate_concepts: tuple[str, ...],
+        off_mandate_signals: tuple[str, ...],
+    ) -> tuple[bool, str]:
+        labels = self._labels.get(persona_slug, {})
+        if not labels:
+            return True, "VERDICT: PASS\nJUSTIFICATION: No action stances to classify."
+
+        block_lines = ["THESIS_REASONING_START"]
+        for ticker, label in labels.items():
+            block_lines.append(f"{ticker}: {label}")
+        block_lines.append("THESIS_REASONING_END")
+
+        body = "\n".join(block_lines)
+        # Return as the justification string so parse_judge_response_with_thesis
+        # can extract it (passed is unused in the thesis-reasoning call path).
+        return True, f"VERDICT: PASS\nJUSTIFICATION: Thesis classifications below.\n{body}"
+
+
 # ---------------------------------------------------------------------------
 # Validator-claim persistence (M1-014 / Component 20)
 # ---------------------------------------------------------------------------
@@ -537,7 +607,7 @@ def parse_judge_response(raw: str) -> tuple[bool, str]:
     Used by the orchestration layer after receiving the subagent's text output.
     """
     verdict_match = re.search(r"VERDICT:\s*(PASS|FAIL)", raw, re.IGNORECASE)
-    just_match = re.search(r"JUSTIFICATION:\s*(.+)", raw, re.DOTALL | re.IGNORECASE)
+    just_match = re.search(r"JUSTIFICATION:\s*(.+?)(?=\nTHESIS_REASONING_START|\Z)", raw, re.DOTALL | re.IGNORECASE)
 
     if not verdict_match:
         # Malformed response — conservative fail.
@@ -547,6 +617,314 @@ def parse_judge_response(raw: str) -> tuple[bool, str]:
     passed = verdict_match.group(1).upper() == "PASS"
     justification = just_match.group(1).strip() if just_match else raw
     return passed, justification
+
+
+def parse_judge_response_with_thesis(
+    raw: str,
+) -> tuple[bool, str, dict[str, str]]:
+    """Parse the extended judge response that includes per-stance thesis_reasoning.
+
+    Used by the session after receiving the subagent's text output when the
+    extended M6-005 judge prompt was used (stances were included in the dispatch).
+
+    Returns:
+        (passed, justification, thesis_reasoning_map) where thesis_reasoning_map
+        is a dict of {ticker: "genuine"|"reactive"}.  An empty dict means the
+        judge returned no THESIS_REASONING block (e.g., old-format response or
+        no action stances were present).
+
+    The expected format added by the extended judge prompt::
+
+        VERDICT: PASS
+        JUSTIFICATION: <one paragraph>
+        THESIS_REASONING_START
+        <TICKER>: genuine
+        <TICKER>: reactive
+        THESIS_REASONING_END
+    """
+    passed, justification = parse_judge_response(raw)
+
+    thesis_map: dict[str, str] = {}
+    block_match = re.search(
+        r"THESIS_REASONING_START\s*\n(.+?)\nTHESIS_REASONING_END",
+        raw,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if block_match:
+        for line in block_match.group(1).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Expected: "AAPL: genuine" or "MSFT: reactive"
+            colon_idx = line.rfind(":")
+            if colon_idx == -1:
+                continue
+            ticker = line[:colon_idx].strip().upper()
+            label = line[colon_idx + 1:].strip().lower()
+            if label in (THESIS_GENUINE, THESIS_REACTIVE) and ticker:
+                thesis_map[ticker] = label
+            else:
+                logger.warning(
+                    "Unknown thesis_reasoning label for ticker=%r: %r (expected genuine|reactive)",
+                    ticker,
+                    label,
+                )
+
+    return passed, justification, thesis_map
+
+
+# ---------------------------------------------------------------------------
+# M6-005: Thesis-presence gate + genuine-vs-reactive stance validator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StanceThesisResult:
+    """Result of validating Round-1 stances for thesis-presence + genuine-vs-reactive.
+
+    Always ``passed=True`` — a reactive flag is surfaced, NOT auto-blocked.
+    The notes string contains a machine-readable summary of:
+    - Any stances that failed the deterministic thesis-PRESENCE gate (missing reason).
+    - Per-stance genuine-vs-reactive labels from the judge (if judge was provided).
+
+    Notes are written to ``persona_reports.validator_notes`` (appended to any
+    existing notes from the research-report validation pass).
+
+    ``reactive_flags``: list of tickers whose thesis_status.reason the judge
+    scored as reactive price-churn.  Empty when the judge was not called or
+    returned all genuine.
+
+    ``presence_failures``: list of tickers that failed the deterministic
+    thesis-PRESENCE gate (missing or empty reason).
+    """
+
+    notes: str
+    presence_failures: list[str]
+    reactive_flags: list[str]
+    thesis_reasoning: dict[str, str]  # {ticker: "genuine"|"reactive"}
+
+    # Always True — reactive is flagged, not blocked.
+    passed: bool = True
+    stage: str = STAGE_THESIS_PRESENCE
+
+
+def _run_thesis_presence_gate(
+    stances: list[dict],
+    persona_slug: str,
+) -> tuple[list[str], list[str]]:
+    """Deterministic check: every EXIT/REDUCE/ADD stance carries a non-empty thesis_status.reason.
+
+    Defense-in-depth mirror of Component 14's parse-time contract (round1.py
+    _extract_and_validate_thesis_status).  Component 14 enforces at parse time;
+    Component 11 re-checks at validate time — same design as the fully-invested
+    invariant being checked at Component 11 AND backstopped at Component 15.
+
+    Returns:
+        (failures, action_tickers) where:
+        - failures: list of "{ticker} ({action}): missing thesis_status.reason" strings
+        - action_tickers: list of tickers whose action is in _THESIS_REQUIRED_ACTIONS
+    """
+    failures: list[str] = []
+    action_tickers: list[str] = []
+
+    for stance in stances:
+        action = str(stance.get("action", "")).lower()
+        ticker = str(stance.get("ticker", "UNKNOWN")).upper()
+
+        if action not in _THESIS_REQUIRED_ACTIONS:
+            continue  # HOLD is exempt
+
+        action_tickers.append(ticker)
+        ts = stance.get("thesis_status")
+
+        if not ts or not isinstance(ts, dict):
+            failures.append(f"{ticker} ({action}): thesis_status missing or not an object")
+            logger.warning(
+                "[%s] thesis-presence gate FAIL: %s (%s) missing thesis_status",
+                persona_slug, ticker, action,
+            )
+            continue
+
+        reason = str(ts.get("reason", "")).strip()
+        if not reason:
+            failures.append(f"{ticker} ({action}): thesis_status.reason is empty")
+            logger.warning(
+                "[%s] thesis-presence gate FAIL: %s (%s) has empty thesis_status.reason",
+                persona_slug, ticker, action,
+            )
+
+    return failures, action_tickers
+
+
+def validate_round1_stances(
+    stances: list[dict],
+    persona_slug: str,
+    mandate: str = "",
+    judge_raw_response: Optional[str] = None,
+) -> "StanceThesisResult":
+    """Validate Round-1 stances for thesis discipline — M6-005 entry point.
+
+    Called AFTER ``capture_round1_stances()`` (Stage 3 of /weekly-run), NOT
+    inside ``run_persona_research()`` (Stage 1).  The stances don't exist until
+    Round-1 is complete.
+
+    Two gates run in order:
+
+    Gate A — Deterministic thesis-PRESENCE (zero dispatch):
+        Every EXIT/REDUCE/ADD stance must carry a non-empty thesis_status.reason.
+        Missing → recorded in ``presence_failures``; does NOT auto-block.
+
+    Gate B — Genuine-vs-reactive classification (parsed from the captured judge response):
+        Parses the per-stance THESIS_REASONING_START…THESIS_REASONING_END block
+        from the raw judge response string that the session captured during its
+        ONE judge call per persona.  The extended judge prompt (M6-005) instructs
+        the judge to include this block in the same response as the on-mandate
+        VERDICT/JUSTIFICATION — so both are extracted from the identical captured
+        string.
+
+        **No second judge dispatch.**  ``judge_raw_response`` is the raw string
+        the session already holds from ``parse_judge_response()``'s input.  The
+        session passes it here so the thesis block can be extracted from the same
+        response.  ``ReplayJudge.judge()`` is NOT called — doing so would require
+        a second captured verdict per persona and break the W25 budget envelope.
+
+        A reactive flag is surfaced in ``reactive_flags`` + notes; it does NOT
+        auto-block the run (consistent with the per-archetype-cash precedent).
+
+    Args:
+        stances:            List of stance dicts from the persona's Round-1 output.
+                            Each dict has at minimum: {"ticker", "action", "thesis_status"}.
+        persona_slug:       e.g. "value", "technical".
+        mandate:            Unused by the engine (kept for callers that previously
+                            passed it); retained for forward-compat.
+        judge_raw_response: Optional raw string returned by the judge subagent for
+                            this persona.  When provided, ``parse_judge_response_with_thesis``
+                            extracts the per-stance THESIS_REASONING block.  When None,
+                            only Gate A (deterministic) runs.
+
+    Returns:
+        ``StanceThesisResult`` — always passed=True; notes/reactive_flags carry
+        the surfaced findings for the session to present to the founder.
+    """
+    # Gate A — deterministic thesis-PRESENCE.
+    presence_failures, action_tickers = _run_thesis_presence_gate(stances, persona_slug)
+
+    # Gate B — genuine-vs-reactive: parse from the captured judge response string.
+    # Only stances with non-empty reasons are eligible for classification.
+    stances_for_judge = [
+        s for s in stances
+        if str(s.get("action", "")).lower() in _THESIS_REQUIRED_ACTIONS
+        and isinstance(s.get("thesis_status"), dict)
+        and str(s.get("thesis_status", {}).get("reason", "")).strip()
+    ]
+
+    thesis_reasoning: dict[str, str] = {}
+    reactive_flags: list[str] = []
+    judge_notes = ""
+
+    if judge_raw_response is not None and stances_for_judge:
+        # Parse the THESIS_REASONING block from the already-captured judge response.
+        # This is the SAME raw string the session captured from the ONE judge call per
+        # persona (for the on-mandate verdict).  No judge.judge() invocation here.
+        _passed_unused, _just_unused, thesis_reasoning = parse_judge_response_with_thesis(
+            judge_raw_response
+        )
+
+        # Inline fallback: if the response doesn't contain a THESIS_REASONING block
+        # (e.g. old-format response or stances were absent when the session ran),
+        # attempt the compact pipe-separated format that test helpers may emit.
+        if not thesis_reasoning:
+            thesis_reasoning = _parse_inline_thesis_reasoning(judge_raw_response)
+
+        reactive_flags = [
+            ticker for ticker, label in thesis_reasoning.items()
+            if label == THESIS_REACTIVE
+        ]
+
+        if reactive_flags:
+            judge_notes = (
+                f"THESIS-REACTIVE FLAG(S): {', '.join(reactive_flags)} — "
+                "thesis_status.reason appears to be reactive price-churn, not a "
+                "genuine medium-term hypothesis change. NOT auto-blocked — "
+                "surfaced for founder judgment."
+            )
+            logger.info(
+                "[%s] thesis-reactive flags: %s", persona_slug, reactive_flags
+            )
+        else:
+            judge_notes = (
+                f"Thesis-reasoning: all {len(thesis_reasoning)} action stance(s) "
+                "classified as GENUINE medium-term thesis changes."
+            ) if thesis_reasoning else ""
+
+    # Compose notes (written to validator_notes).
+    notes_parts: list[str] = []
+    if presence_failures:
+        notes_parts.append(
+            "THESIS-PRESENCE GATE FAIL — missing thesis_status.reason on: "
+            + "; ".join(presence_failures)
+        )
+    if judge_notes:
+        notes_parts.append(judge_notes)
+    if not notes_parts:
+        count = len(action_tickers)
+        notes_parts.append(
+            f"Thesis discipline: {count} action stance(s) passed presence gate"
+            + ("; genuine-vs-reactive: all genuine" if thesis_reasoning else "")
+            + "."
+        )
+
+    return StanceThesisResult(
+        notes=" | ".join(notes_parts),
+        presence_failures=presence_failures,
+        reactive_flags=reactive_flags,
+        thesis_reasoning=thesis_reasoning,
+        passed=True,
+        stage=STAGE_THESIS_PRESENCE if not thesis_reasoning else STAGE_THESIS_REASONING,
+    )
+
+
+def _build_stances_block(stances: list[dict], persona_slug: str) -> str:
+    """Serialize action stances into the block injected into the judge prompt.
+
+    The ROUND-1 STANCES marker lets the judge detect thesis-reasoning mode.
+    """
+    lines = [
+        f"ROUND-1 STANCES FOR THESIS DISCIPLINE JUDGMENT (persona: {persona_slug})",
+        "",
+    ]
+    for s in stances:
+        ticker = str(s.get("ticker", "UNKNOWN")).upper()
+        action = str(s.get("action", "")).lower()
+        ts = s.get("thesis_status", {}) or {}
+        verdict = ts.get("verdict", "")
+        reason = ts.get("reason", "")
+        lines.append(f"TICKER: {ticker}")
+        lines.append(f"ACTION: {action}")
+        lines.append(f"THESIS_VERDICT: {verdict}")
+        lines.append(f"THESIS_REASON: {reason}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _parse_inline_thesis_reasoning(raw: str) -> dict[str, str]:
+    """Fallback: extract ticker->label pairs from a plain-text stub response.
+
+    The StubOnMandateJudgeWithThesis returns a compact string like
+    ``"AAPL: genuine | MSFT: reactive"`` when a THESIS_REASONING block is absent.
+    This helper parses that format so unit tests don't need to embed the full
+    block format.
+    """
+    result: dict[str, str] = {}
+    for segment in re.split(r"[|\n]", raw):
+        segment = segment.strip()
+        colon_idx = segment.rfind(":")
+        if colon_idx == -1:
+            continue
+        ticker = segment[:colon_idx].strip().upper()
+        label = segment[colon_idx + 1:].strip().lower()
+        if ticker and label in (THESIS_GENUINE, THESIS_REACTIVE):
+            result[ticker] = label
+    return result
 
 
 # ---------------------------------------------------------------------------

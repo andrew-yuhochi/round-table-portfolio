@@ -1,0 +1,15 @@
+{
+  "_fixture_meta": {
+    "id": "presence-fail-001",
+    "category": "presence_gate",
+    "expected_gate_result": "FAIL",
+    "description": "EXIT stance with no thesis_status field at all — must fail the deterministic presence gate.",
+    "provenance": "hand-authored 2026-06-22; tests the absent-key branch of _run_thesis_presence_gate"
+  },
+  "stances": [
+    {
+      "ticker": "TSLA",
+      "action": "exit"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "genuine-004",
+    "category": "genuine",
+    "persona": "technical",
+    "expected_label": "genuine",
+    "description": "Technical persona exits XBI citing a decisive breakdown of the multi-month base with volume confirmation — medium-term structure broken, not single-bar noise.",
+    "provenance": "hand-authored 2026-06-22; language mirrors technical.md HOLDING HORIZON clause (lines 62-78): 'primary trend reversal — confirmed breakdown of a major base, decisive break of a key support level on volume'"
+  },
+  "stances": [
+    {
+      "ticker": "XBI",
+      "action": "exit",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": "XBI has broken decisively below the 18-month ascending base on three consecutive weekly closes with volume running 180% of the 52-week average. The relative-strength regime vs. SPY has deteriorated from outperform to confirmed underperform over the past 10 weeks. The medium-term primary trend has reversed — this is not a single bar printing against an intact trend, it is the structure itself that has broken. Exiting per holding-horizon discipline."
+      }
+    }
+  ]
+}

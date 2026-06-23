@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "genuine-003",
+    "category": "genuine",
+    "persona": "cta-systematic-macro",
+    "expected_label": "genuine",
+    "description": "CTA persona exits SMH citing a confirmed multi-week medium-term trend break (not a single week's move) — archetype-legitimate; must NOT be scored reactive.",
+    "provenance": "hand-authored 2026-06-22; CTA trend-break language mirrors the HOLDING HORIZON clause in .claude/agents/cta-systematic-macro.md §HOLDING HORIZON lines 76-83"
+  },
+  "stances": [
+    {
+      "ticker": "SMH",
+      "action": "exit",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": "The medium-term uptrend in SMH has now confirmed a reversal: the 20-week moving average crossed below the 40-week MA for the first time in 18 months, and the weekly close has printed below the prior 3-month base on the highest weekly volume since Q3 2022. This is a confirmed medium-term momentum regime change — not single-week noise — consistent with my signal discipline for acting on confirmed multi-month trend breaks. The trend that justified the position is no longer intact."
+      }
+    }
+  ]
+}

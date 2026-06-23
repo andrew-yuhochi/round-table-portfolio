@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "reactive-001",
+    "category": "reactive",
+    "persona": "value",
+    "expected_label": "reactive",
+    "description": "Value persona exits PYPL citing only price drop and momentum turn — no change to medium-term FCF thesis.",
+    "provenance": "hand-authored 2026-06-22; pattern observed in W24 real run where value persona reduced PYPL citing 'down 9% this week'; PII-stripped, ticker unchanged"
+  },
+  "stances": [
+    {
+      "ticker": "PYPL",
+      "action": "exit",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": "PYPL is down 9% this week and momentum has turned decisively negative. The stock broke below its 200-day moving average on heavy volume."
+      }
+    }
+  ]
+}

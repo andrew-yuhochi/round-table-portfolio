@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "reactive-003",
+    "category": "reactive",
+    "persona": "value",
+    "expected_label": "reactive",
+    "description": "Value persona EXIT with thesis_verdict: intact — the clearest reactive signal: exiting a name whose thesis the persona concedes has not changed.",
+    "provenance": "hand-authored 2026-06-22; thesis_verdict: intact + EXIT is explicitly identified as reactive in TDD M6-005 spec §2 CATCH clause"
+  },
+  "stances": [
+    {
+      "ticker": "BRK.B",
+      "action": "exit",
+      "thesis_status": {
+        "verdict": "intact",
+        "reason": "BRK.B has been rangebound for six weeks and the price action is sluggish. We see better near-term opportunities elsewhere and are rotating capital."
+      }
+    }
+  ]
+}

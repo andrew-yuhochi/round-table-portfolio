@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "genuine-002",
+    "category": "genuine",
+    "persona": "growth",
+    "expected_label": "genuine",
+    "description": "Growth persona reduces NKLA citing balance-sheet deterioration (cash runway <6 months) and dilution risk that structurally breaks the growth-at-scale thesis.",
+    "provenance": "hand-authored 2026-06-22; NKLA balance sheet issues are public record; no live-run data used"
+  },
+  "stances": [
+    {
+      "ticker": "NKLA",
+      "action": "reduce",
+      "thesis_status": {
+        "verdict": "broken",
+        "reason": "The growth thesis assumed NKLA would reach unit economics breakeven before requiring further dilutive capital raises. Cash runway is now below 6 months and the company filed a preliminary prospectus for an additional equity offering at a 40% discount to NAV. This is not a price-volatility issue — it is a structural change in the capital requirements that invalidates the path-to-scale thesis we underwrote."
+      }
+    }
+  ]
+}

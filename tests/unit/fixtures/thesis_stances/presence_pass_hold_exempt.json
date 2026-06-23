@@ -1,0 +1,15 @@
+{
+  "_fixture_meta": {
+    "id": "presence-pass-001",
+    "category": "presence_gate",
+    "expected_gate_result": "PASS",
+    "description": "HOLD stance with no thesis_status — must PASS (HOLD is exempt from the thesis-presence gate).",
+    "provenance": "hand-authored 2026-06-22; tests the HOLD-exempt branch of _run_thesis_presence_gate"
+  },
+  "stances": [
+    {
+      "ticker": "AAPL",
+      "action": "hold"
+    }
+  ]
+}

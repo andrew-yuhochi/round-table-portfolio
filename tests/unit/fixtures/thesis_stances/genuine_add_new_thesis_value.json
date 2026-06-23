@@ -1,0 +1,20 @@
+{
+  "_fixture_meta": {
+    "id": "genuine-005",
+    "category": "genuine_add",
+    "persona": "value",
+    "expected_label": "genuine",
+    "description": "Value persona adds WBA citing a specific medium-term FCF recovery thesis — new hypothesis with forward-looking rationale, not price momentum.",
+    "provenance": "hand-authored 2026-06-22; WBA turnaround thesis is public; sanitised"
+  },
+  "stances": [
+    {
+      "ticker": "WBA",
+      "action": "add",
+      "thesis_status": {
+        "verdict": "new",
+        "reason": "Initiating a medium-term recovery thesis: WBA is trading at 0.4x book and 3.5x forward FCF after a 70% drawdown that priced in a going-concern scenario. The new CEO's pharmacy-closure plan removes $500M of annualised cash drain by Q4; insurance reimbursement rate headwinds are already reflected in sell-side consensus. The thesis is: balance-sheet stabilisation (funded through the Shields Health stake sale) + pharmacy rationalisation restores FCF to $600M–$800M within 18–24 months, at which point the stock re-rates from distressed to recovery multiple."
+      }
+    }
+  ]
+}
