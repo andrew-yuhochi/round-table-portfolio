@@ -11,7 +11,7 @@ Coverage matrix (TDD Component 19 M6 Extension, Sample Selection):
 
   Real-data anchor (W24→W25 committed fixture):
     test_w24_w25_anchor                         — reproduces the ~48.45% figure
-    test_w24_w25_breakdown_counts               — added=19, removed=17, re-weighted=19
+    test_w24_w25_breakdown_counts               — added=14, removed=11, re-weighted=19
 
   Surfacing checks — preview line:
     test_preview_line_present_normal_week       — preview_line contains "Consensus turnover"
@@ -178,7 +178,7 @@ def test_w24_w25_anchor() -> None:
 
 
 def test_w24_w25_breakdown_counts() -> None:
-    """W24→W25 breakdown: added=19, removed=17, re-weighted=19."""
+    """W24→W25 breakdown: added=14, removed=11, re-weighted=19."""
     result = compute_consensus_turnover(W24_HOLDINGS, W25_HOLDINGS)
     assert result.n_added == EXPECTED_N_ADDED, (
         f"n_added: got {result.n_added}, expected {EXPECTED_N_ADDED}"
