@@ -254,6 +254,10 @@ def _make_round1_output(slug: str, debate_set: list[str]) -> str:
             "target_weight": stance_weight,
             "confidence": 3,
             "rationale": f"Stub Round-1 rationale for {t} by {slug}.",
+            "thesis_status": {
+                "verdict": "new",
+                "reason": f"Initiating medium-term thesis on {t}: secular growth driver identified.",
+            },
         }
         for t in debate_set
     ]

@@ -14,11 +14,21 @@ Component 14 (`capture_round1_stances`):
     other persona's Round-1 output.  The prompt builder is injected so tests
     can assert isolation without needing live subagent output.
 
+    thesis_status contract (M6-004):
+    Every EXIT/REDUCE/ADD stance must carry a non-empty `thesis_status` sub-object
+    with a valid `verdict` (broken|intact for EXIT/REDUCE; new for ADD) and a
+    non-empty `reason` referencing the medium-term hypothesis change.  Missing or
+    empty on an action-bearing stance is a Round1ParseError — same fail-loudly
+    treatment as out-of-domain action/confidence.  HOLD stances are exempt.
+    thesis_status content is serialized into the existing `agent_stances.rationale`
+    field (no schema change — Critical Component #2 preserved).
+
 Fail-loudly principle (TDD §1.4 / Gate 5):
-    Out-of-domain action, confidence outside 1..5, or target_weight outside
-    [0, max_position_weight] all raise Round1ParseError immediately.  No silent
-    coercion.  These are contract violations — the caller (orchestrator) must
-    decide whether to re-prompt or abort.
+    Out-of-domain action, confidence outside 1..5, target_weight outside
+    [0, max_position_weight], or missing thesis_status on action stances all
+    raise Round1ParseError immediately.  No silent coercion.  These are contract
+    violations — the caller (orchestrator) must decide whether to re-prompt or
+    abort.
 """
 
 from __future__ import annotations
@@ -53,6 +63,17 @@ _ACTION_NORMALISE: dict[str, str] = {
 }
 
 _DEFAULT_DEBATE_SET_CEILING = 40
+
+# Actions that require a thesis_status sub-object in the Round-1 JSON (M6-004).
+# HOLD is exempt — a persona maintaining a position needs no thesis-change justification.
+_THESIS_STATUS_REQUIRED_ACTIONS = frozenset({"add", "reduce", "exit"})
+
+# Valid verdict values per action class.
+_VALID_VERDICTS_FOR_ACTION: dict[str, frozenset[str]] = {
+    "exit":   frozenset({"broken", "intact"}),
+    "reduce": frozenset({"broken", "intact"}),
+    "add":    frozenset({"new"}),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +362,80 @@ def _default_prompt_builder(
 
 
 # ---------------------------------------------------------------------------
+# thesis_status validator + rationale serializer (M6-004)
+# ---------------------------------------------------------------------------
+
+def _extract_and_validate_thesis_status(
+    item: dict[str, Any],
+    action: str,
+    raw_ticker: str,
+    stance_index: int,
+    persona_slug: str,
+    base_rationale: str,
+) -> str:
+    """Validate thesis_status presence/shape for action stances; fold into rationale.
+
+    EXIT/REDUCE/ADD → thesis_status REQUIRED; verdict must be in the valid set for
+    the action; reason must be non-empty.
+
+    HOLD → thesis_status MAY be absent; if present it is accepted and folded in
+    (no enforcement on its content, since substance is Component 11's job).
+
+    Returns:
+        The rationale string to store in agent_stances.rationale:
+        - For HOLD with no thesis_status: the base rationale unchanged.
+        - For any stance WITH thesis_status: base rationale + a labeled
+          "THESIS STATUS:" section (verdict + reason).
+
+    Raises:
+        Round1ParseError: thesis_status missing/empty on EXIT/REDUCE/ADD, or
+            verdict is not valid for the action.
+    """
+    ts_raw = item.get("thesis_status")
+    requires_ts = action in _THESIS_STATUS_REQUIRED_ACTIONS
+
+    if ts_raw is None:
+        if requires_ts:
+            raise Round1ParseError(
+                f"[{persona_slug}] stances[{stance_index}] ticker={raw_ticker!r}: "
+                f"action={action!r} requires 'thesis_status' but it is absent.  "
+                "Every EXIT/REDUCE/ADD stance must justify the thesis change."
+            )
+        # HOLD with no thesis_status — return rationale unchanged.
+        return base_rationale
+
+    if not isinstance(ts_raw, dict):
+        raise Round1ParseError(
+            f"[{persona_slug}] stances[{stance_index}] ticker={raw_ticker!r}: "
+            f"'thesis_status' must be a JSON object, got {type(ts_raw).__name__!r}."
+        )
+
+    verdict = str(ts_raw.get("verdict", "")).strip().lower()
+    reason = str(ts_raw.get("reason", "")).strip()
+
+    if requires_ts:
+        # Validate verdict is in the allowed set for this action.
+        valid_verdicts = _VALID_VERDICTS_FOR_ACTION[action]
+        if verdict not in valid_verdicts:
+            raise Round1ParseError(
+                f"[{persona_slug}] stances[{stance_index}] ticker={raw_ticker!r}: "
+                f"thesis_status.verdict={verdict!r} is not valid for action={action!r}.  "
+                f"Expected one of {sorted(valid_verdicts)}.  No silent coercion."
+            )
+        if not reason:
+            raise Round1ParseError(
+                f"[{persona_slug}] stances[{stance_index}] ticker={raw_ticker!r}: "
+                f"thesis_status.reason is empty for action={action!r}.  "
+                "The reason must state what changed in the medium-term hypothesis."
+            )
+
+    # Serialize thesis_status into the rationale text (no new column — rides
+    # the existing agent_stances.rationale field per Critical Component #2).
+    ts_section = f"\nTHESIS STATUS: verdict={verdict} | reason={reason}"
+    return base_rationale + ts_section
+
+
+# ---------------------------------------------------------------------------
 # Round-1 JSON parser (fail-loudly on any violation)
 # ---------------------------------------------------------------------------
 
@@ -462,6 +557,16 @@ def _parse_round1_reply(
 
         rationale = str(item.get("rationale", "")).strip()
 
+        # thesis_status enforcement (M6-004): required on EXIT/REDUCE/ADD; HOLD exempt.
+        rationale_with_thesis = _extract_and_validate_thesis_status(
+            item=item,
+            action=action,
+            raw_ticker=raw_ticker,
+            stance_index=i,
+            persona_slug=persona_slug,
+            base_rationale=rationale,
+        )
+
         stances.append(AgentStancePayload(
             week_id=week_id,
             persona=persona_slug,
@@ -470,7 +575,7 @@ def _parse_round1_reply(
             action=action,
             target_weight=target_weight,
             confidence=confidence,
-            rationale=rationale,
+            rationale=rationale_with_thesis,
         ))
         covered.add(raw_ticker)
 

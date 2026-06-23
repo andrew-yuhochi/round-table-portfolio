@@ -202,6 +202,10 @@ def _make_round1_output_week_a(slug: str) -> str:
                     "AI infrastructure leader at P/E=28, strong FCF. "
                     "Adding at current levels."
                 ),
+                "thesis_status": {
+                    "verdict": "new",
+                    "reason": "Initiating medium-term thesis on NVDA: AI infrastructure cycle thesis — data-center capex upcycle supports 3yr revenue CAGR.",
+                },
             },
             {
                 "ticker": "AAPL",
@@ -209,6 +213,10 @@ def _make_round1_output_week_a(slug: str) -> str:
                 "target_weight": 0.10,
                 "confidence": 3,
                 "rationale": "Solid balance sheet, steady buybacks.",
+                "thesis_status": {
+                    "verdict": "new",
+                    "reason": "Initiating medium-term thesis on AAPL: services-mix shift drives margin expansion over 3yr horizon.",
+                },
             },
         ] + [
             {
@@ -230,6 +238,10 @@ def _make_round1_output_week_a(slug: str) -> str:
                 "target_weight": 0.10,
                 "confidence": 3,
                 "rationale": f"Constructive on {t} — stub R1 WEEK-A.",
+                "thesis_status": {
+                    "verdict": "new",
+                    "reason": f"Initiating medium-term thesis on {t}: secular growth driver identified.",
+                },
             }
             for t in _SYNTHETIC_DEBATE_TICKERS
         ]
@@ -252,6 +264,10 @@ def _make_round1_output_week_b(slug: str) -> str:
             "target_weight": 0.10,
             "confidence": 3,
             "rationale": f"Constructive on {t} — stub R1 WEEK-B.",
+            "thesis_status": {
+                "verdict": "new",
+                "reason": f"Initiating medium-term thesis on {t}: secular growth driver identified.",
+            },
         }
         for t in _SYNTHETIC_DEBATE_TICKERS
     ]
@@ -283,6 +299,10 @@ def _make_round1_output_week_c(slug: str) -> str:
                     "Conviction reduced; trimming position. FCF still positive but risk/reward "
                     "has deteriorated vs original thesis."
                 ),
+                "thesis_status": {
+                    "verdict": "broken",
+                    "reason": "Medium-term AI infrastructure thesis partially broken: data-center capex growth rate has decelerated materially from original assumption, reducing the 3yr revenue CAGR estimate.",
+                },
             },
             {
                 "ticker": "AAPL",
@@ -290,6 +310,10 @@ def _make_round1_output_week_c(slug: str) -> str:
                 "target_weight": 0.15,
                 "confidence": 4,
                 "rationale": "Rotating into AAPL; better margin-of-safety after pullback.",
+                "thesis_status": {
+                    "verdict": "new",
+                    "reason": "Initiating medium-term thesis on AAPL: services-mix shift drives margin expansion over 3yr horizon; entry price improves risk/reward.",
+                },
             },
         ] + [
             {
@@ -311,6 +335,10 @@ def _make_round1_output_week_c(slug: str) -> str:
                 "target_weight": 0.10,
                 "confidence": 3,
                 "rationale": f"Constructive on {t} — stub R1 WEEK-C.",
+                "thesis_status": {
+                    "verdict": "new",
+                    "reason": f"Initiating medium-term thesis on {t}: secular growth driver identified.",
+                },
             }
             for t in _SYNTHETIC_DEBATE_TICKERS
         ]
@@ -345,6 +373,10 @@ def _make_round1_output_week_d(slug: str) -> str:
             "target_weight": 0.10,
             "confidence": 3,
             "rationale": f"Constructive on {t} — stub R1 WEEK-D real-data leg.",
+            "thesis_status": {
+                "verdict": "new",
+                "reason": f"Initiating medium-term thesis on {t}: secular growth driver identified.",
+            },
         }
         for t in _SYNTHETIC_DEBATE_TICKERS
     ]

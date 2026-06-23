@@ -36,6 +36,25 @@ Coverage matrix:
     test_prompt_isolation_no_peer_output           — no persona's prompt contains another's Round-1 output
     test_custom_prompt_builder_injected            — prompt_builder callable is called per persona
 
+  Component 14 — thesis_status contract (M6-004):
+    test_exit_with_thesis_status_parses_clean      — valid EXIT + thesis_status accepted
+    test_reduce_with_thesis_status_parses_clean    — valid REDUCE + thesis_status accepted
+    test_add_with_thesis_status_parses_clean       — valid ADD + thesis_status accepted
+    test_hold_without_thesis_status_parses_clean   — HOLD with no thesis_status exempt
+    test_hold_with_thesis_status_parses_clean      — HOLD with optional thesis_status accepted
+    test_exit_missing_thesis_status_raises         — EXIT missing thesis_status → parse error
+    test_reduce_missing_thesis_status_raises       — REDUCE missing thesis_status → parse error
+    test_add_missing_thesis_status_raises          — ADD missing thesis_status → parse error
+    test_exit_empty_reason_raises                  — EXIT with empty reason → parse error
+    test_exit_invalid_verdict_raises               — EXIT with verdict=new → parse error
+    test_add_invalid_verdict_raises                — ADD with verdict=broken → parse error
+    test_thesis_status_serialized_into_rationale   — content folded into agent_stances.rationale
+    test_thesis_status_present_in_rationale_text   — 'THESIS STATUS:' label in rationale
+    test_hold_rationale_unchanged_no_thesis_status — HOLD rationale clean when no thesis_status
+    test_intact_verdict_allowed_on_exit            — EXIT verdict=intact is valid parse (C11 flags)
+    test_intact_verdict_allowed_on_reduce          — REDUCE verdict=intact is valid parse
+    test_multiple_action_stances_all_require_ts    — per-stance enforcement (not just first)
+
   Component 14 — Round1Capture shape:
     test_round1_capture_has_prompts_field          — prompts dict keyed by persona slug
     test_counterfactuals_keyed_by_persona          — 7 entries, each has CASH key
@@ -206,17 +225,37 @@ def _make_round1_json(
     weight: float = 0.10,
     counterfactual: dict[str, float] | None = None,
 ) -> str:
-    """Build a valid ROUND 1 OUTPUT SCHEMA JSON string for the given debate set."""
-    stances = [
-        {
+    """Build a valid ROUND 1 OUTPUT SCHEMA JSON string for the given debate set.
+
+    Includes thesis_status on every EXIT/REDUCE/ADD stance (M6-004 contract).
+    HOLD stances are produced without thesis_status (exempt by spec).
+    """
+    _action_upper = action.upper()
+    _action_lower = action.lower()
+
+    def _stance(t: str) -> dict:
+        base: dict = {
             "ticker": t,
             "action": action,
             "target_weight": weight,
             "confidence": confidence,
             "rationale": f"{persona} on {t}: momentum indicators positive.",
         }
-        for t in debate_set
-    ]
+        # HOLD is exempt; all other actions require thesis_status.
+        if _action_upper != "HOLD":
+            if _action_upper == "ADD":
+                base["thesis_status"] = {
+                    "verdict": "new",
+                    "reason": f"Initiating medium-term thesis on {t}: secular growth driver identified.",
+                }
+            else:  # EXIT or REDUCE
+                base["thesis_status"] = {
+                    "verdict": "broken",
+                    "reason": f"Medium-term thesis on {t} broken: key growth driver no longer intact.",
+                }
+        return base
+
+    stances = [_stance(t) for t in debate_set]
     cf = counterfactual or {debate_set[0]: 0.15, "CASH": 0.85}
     schema = {
         "stances": stances,
@@ -617,6 +656,397 @@ class TestCaptureRound1StancesParsing:
         with pytest.raises(Round1ParseError, match="No Round-1 reply"):
             capture_round1_stances(
                 self._debate, results,
+                raw_round1_replies=replies,
+                config=self._cfg,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Component 14 — thesis_status contract (M6-004)
+# ---------------------------------------------------------------------------
+
+class TestThesisStatusContract:
+    """Tests for M6-004: thesis_status required on EXIT/REDUCE/ADD; HOLD exempt.
+
+    Coverage matrix:
+      test_exit_with_thesis_status_parses_clean          — valid EXIT + thesis_status accepted
+      test_reduce_with_thesis_status_parses_clean        — valid REDUCE + thesis_status accepted
+      test_add_with_thesis_status_parses_clean           — valid ADD + thesis_status accepted
+      test_hold_without_thesis_status_parses_clean       — HOLD with no thesis_status accepted (exempt)
+      test_hold_with_thesis_status_parses_clean          — HOLD with thesis_status also accepted
+      test_exit_missing_thesis_status_raises             — EXIT missing thesis_status → parse error
+      test_reduce_missing_thesis_status_raises           — REDUCE missing thesis_status → parse error
+      test_add_missing_thesis_status_raises              — ADD missing thesis_status → parse error
+      test_exit_empty_reason_raises                      — EXIT with empty reason → parse error
+      test_exit_invalid_verdict_raises                   — EXIT with verdict=new → parse error
+      test_add_invalid_verdict_raises                    — ADD with verdict=broken → parse error
+      test_thesis_status_serialized_into_rationale       — thesis_status folded into agent_stances.rationale
+      test_hold_rationale_unchanged_no_thesis_status     — HOLD rationale not modified when no thesis_status
+      test_thesis_status_present_in_rationale_text       — THESIS STATUS: label present in rationale
+      test_intact_verdict_allowed_on_exit                — EXIT with verdict=intact is a valid parse (flag for C11, not parse error)
+      test_intact_verdict_allowed_on_reduce              — REDUCE with verdict=intact is a valid parse
+      test_multiple_action_stances_all_require_ts        — all EXIT/REDUCE/ADD in one reply need thesis_status
+    """
+
+    _debate = ["AAPL", "MSFT"]
+    _cfg = {"max_position_weight": MAX_WEIGHT}
+
+    def _results(self) -> list[PersonaResearchResult]:
+        ticker_sets = _uniform_ticker_sets(directs=self._debate)
+        return _make_7_results(ticker_sets)
+
+    def _make_replies_with_override(self, persona: str, debate: list[str], override: dict) -> dict[str, str]:
+        """All 7 personas return valid JSON; one persona gets an overridden stance."""
+        replies = _make_all_round1_replies(debate)
+        base_data = json.loads(replies[persona])
+        # Apply overrides to first stance
+        base_data["stances"][0].update(override)
+        replies[persona] = json.dumps(base_data)
+        return replies
+
+    def _single_stance_reply(
+        self,
+        persona: str,
+        ticker: str,
+        action: str,
+        thesis_status: dict | None = None,
+        include_ts: bool = True,
+    ) -> dict[str, str]:
+        """Build replies where one persona has a single-ticker debate with custom thesis_status."""
+        debate = [ticker]
+        replies = {}
+        for slug in PERSONA_SLUGS_7:
+            stance: dict = {
+                "ticker": ticker,
+                "action": action,
+                "target_weight": 0.10,
+                "confidence": 3,
+                "rationale": f"{slug} on {ticker}: thesis evaluation.",
+            }
+            if include_ts and thesis_status is not None:
+                stance["thesis_status"] = thesis_status
+            elif not include_ts:
+                pass  # explicitly no thesis_status
+            stances_list = [stance]
+            replies[slug] = json.dumps({
+                "stances": stances_list,
+                "counterfactual_portfolio": {ticker: 0.10, "CASH": 0.90},
+                "narrative_summary": f"{slug}: evaluating {ticker}.",
+            })
+        return replies
+
+    # --- Happy-path: valid thesis_status on action stances ---
+
+    def test_exit_with_thesis_status_parses_clean(self) -> None:
+        """Valid EXIT stance with thesis_status accepted."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "value", "AAPL", "EXIT",
+            thesis_status={"verdict": "broken", "reason": "Core moat eroded by regulatory change."},
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        exit_stances = [s for s in capture.stances if s.action == "exit"]
+        assert len(exit_stances) == 7
+
+    def test_reduce_with_thesis_status_parses_clean(self) -> None:
+        """Valid REDUCE stance with thesis_status accepted."""
+        debate = ["MSFT"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "growth", "MSFT", "REDUCE",
+            thesis_status={"verdict": "intact", "reason": "Thesis intact but position sized for risk."},
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        reduce_stances = [s for s in capture.stances if s.action == "reduce"]
+        assert len(reduce_stances) == 7
+
+    def test_add_with_thesis_status_parses_clean(self) -> None:
+        """Valid ADD stance with thesis_status (verdict=new) accepted."""
+        debate = ["NVDA"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "technical", "NVDA", "ADD",
+            thesis_status={"verdict": "new", "reason": "Initiating: AI infrastructure cycle thesis."},
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        add_stances = [s for s in capture.stances if s.action == "add"]
+        assert len(add_stances) == 7
+
+    def test_hold_without_thesis_status_parses_clean(self) -> None:
+        """HOLD stance with no thesis_status is exempt — must parse cleanly."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "value", "AAPL", "HOLD",
+            thesis_status=None,
+            include_ts=False,
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        hold_stances = [s for s in capture.stances if s.action == "hold"]
+        assert len(hold_stances) == 7
+
+    def test_hold_with_thesis_status_parses_clean(self) -> None:
+        """HOLD stance WITH thesis_status also accepted (optional, not enforced)."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "value", "AAPL", "HOLD",
+            thesis_status={"verdict": "intact", "reason": "Monitoring for re-entry trigger."},
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        hold_stances = [s for s in capture.stances if s.action == "hold"]
+        assert len(hold_stances) == 7
+
+    # --- Failure cases: missing / empty / invalid thesis_status ---
+
+    def test_exit_missing_thesis_status_raises(self) -> None:
+        """EXIT stance missing thesis_status → Round1ParseError (fail-loudly)."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply("value", "AAPL", "EXIT", include_ts=False)
+        with pytest.raises(Round1ParseError, match="requires 'thesis_status'"):
+            capture_round1_stances(
+                debate, results,
+                raw_round1_replies=replies,
+                config=self._cfg,
+            )
+
+    def test_reduce_missing_thesis_status_raises(self) -> None:
+        """REDUCE stance missing thesis_status → Round1ParseError."""
+        debate = ["MSFT"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply("growth", "MSFT", "REDUCE", include_ts=False)
+        with pytest.raises(Round1ParseError, match="requires 'thesis_status'"):
+            capture_round1_stances(
+                debate, results,
+                raw_round1_replies=replies,
+                config=self._cfg,
+            )
+
+    def test_add_missing_thesis_status_raises(self) -> None:
+        """ADD stance missing thesis_status → Round1ParseError."""
+        debate = ["NVDA"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply("technical", "NVDA", "ADD", include_ts=False)
+        with pytest.raises(Round1ParseError, match="requires 'thesis_status'"):
+            capture_round1_stances(
+                debate, results,
+                raw_round1_replies=replies,
+                config=self._cfg,
+            )
+
+    def test_exit_empty_reason_raises(self) -> None:
+        """EXIT with thesis_status.reason='' → Round1ParseError."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "value", "AAPL", "EXIT",
+            thesis_status={"verdict": "broken", "reason": ""},
+        )
+        with pytest.raises(Round1ParseError, match="reason is empty"):
+            capture_round1_stances(
+                debate, results,
+                raw_round1_replies=replies,
+                config=self._cfg,
+            )
+
+    def test_exit_invalid_verdict_raises(self) -> None:
+        """EXIT with verdict='new' (ADD-only) → Round1ParseError."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "value", "AAPL", "EXIT",
+            thesis_status={"verdict": "new", "reason": "Should not be 'new' on EXIT."},
+        )
+        with pytest.raises(Round1ParseError, match="not valid for action"):
+            capture_round1_stances(
+                debate, results,
+                raw_round1_replies=replies,
+                config=self._cfg,
+            )
+
+    def test_add_invalid_verdict_raises(self) -> None:
+        """ADD with verdict='broken' (EXIT/REDUCE-only) → Round1ParseError."""
+        debate = ["NVDA"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "technical", "NVDA", "ADD",
+            thesis_status={"verdict": "broken", "reason": "Should not be 'broken' on ADD."},
+        )
+        with pytest.raises(Round1ParseError, match="not valid for action"):
+            capture_round1_stances(
+                debate, results,
+                raw_round1_replies=replies,
+                config=self._cfg,
+            )
+
+    # --- Serialization into rationale ---
+
+    def test_thesis_status_serialized_into_rationale(self) -> None:
+        """thesis_status content appears in the written agent_stances.rationale."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        ts_reason = "Secular demand shift thesis broken: PC refresh cycle stalled."
+        replies = self._single_stance_reply(
+            "value", "AAPL", "EXIT",
+            thesis_status={"verdict": "broken", "reason": ts_reason},
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        exit_stances = [s for s in capture.stances if s.action == "exit"]
+        for s in exit_stances:
+            assert ts_reason in s.rationale, (
+                f"thesis_status reason not found in rationale for {s.persona}: {s.rationale!r}"
+            )
+            assert "broken" in s.rationale, (
+                f"thesis_status verdict not found in rationale for {s.persona}: {s.rationale!r}"
+            )
+
+    def test_thesis_status_present_in_rationale_text(self) -> None:
+        """'THESIS STATUS:' label is present in rationale for action stances."""
+        debate = ["MSFT"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "growth", "MSFT", "ADD",
+            thesis_status={"verdict": "new", "reason": "Cloud margins expanding: new thesis initiated."},
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        for s in capture.stances:
+            assert "THESIS STATUS:" in s.rationale, (
+                f"'THESIS STATUS:' label missing from rationale for {s.persona}: {s.rationale!r}"
+            )
+
+    def test_hold_rationale_unchanged_no_thesis_status(self) -> None:
+        """HOLD with no thesis_status: rationale is the base text, no THESIS STATUS label."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply("value", "AAPL", "HOLD", include_ts=False)
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        for s in capture.stances:
+            assert "THESIS STATUS:" not in s.rationale, (
+                f"'THESIS STATUS:' unexpectedly present on HOLD rationale: {s.rationale!r}"
+            )
+
+    # --- Verdict boundary cases ---
+
+    def test_intact_verdict_allowed_on_exit(self) -> None:
+        """EXIT with verdict=intact is a valid parse (signals for C11, not a parse error)."""
+        debate = ["AAPL"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "value", "AAPL", "EXIT",
+            thesis_status={"verdict": "intact", "reason": "Position exited for risk management, thesis intact."},
+        )
+        # Must NOT raise — intact on EXIT is allowed at parse layer; C11 flags it.
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        exit_stances = [s for s in capture.stances if s.action == "exit"]
+        assert len(exit_stances) == 7
+
+    def test_intact_verdict_allowed_on_reduce(self) -> None:
+        """REDUCE with verdict=intact is a valid parse."""
+        debate = ["MSFT"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies = self._single_stance_reply(
+            "growth", "MSFT", "REDUCE",
+            thesis_status={"verdict": "intact", "reason": "Trimming for position sizing; thesis unchanged."},
+        )
+        capture = capture_round1_stances(
+            debate, results,
+            raw_round1_replies=replies,
+            config=self._cfg,
+        )
+        reduce_stances = [s for s in capture.stances if s.action == "reduce"]
+        assert len(reduce_stances) == 7
+
+    def test_multiple_action_stances_all_require_ts(self) -> None:
+        """All EXIT/REDUCE/ADD stances in a multi-ticker reply need thesis_status.
+
+        Verifies enforcement is per-stance, not just on the first one.
+        """
+        # Build a reply with 2 tickers: AAPL=EXIT (has TS), MSFT=ADD (missing TS).
+        debate = ["AAPL", "MSFT"]
+        ticker_sets = _uniform_ticker_sets(directs=debate)
+        results = _make_7_results(ticker_sets)
+        replies: dict[str, str] = {}
+        for slug in PERSONA_SLUGS_7:
+            stances = [
+                {
+                    "ticker": "AAPL",
+                    "action": "EXIT",
+                    "target_weight": 0.0,
+                    "confidence": 3,
+                    "rationale": "Exiting AAPL.",
+                    "thesis_status": {"verdict": "broken", "reason": "Valuation thesis broken by margin compression."},
+                },
+                {
+                    "ticker": "MSFT",
+                    "action": "ADD",
+                    "target_weight": 0.10,
+                    "confidence": 4,
+                    "rationale": "Adding MSFT.",
+                    # Deliberately missing thesis_status on this ADD
+                },
+            ]
+            replies[slug] = json.dumps({
+                "stances": stances,
+                "counterfactual_portfolio": {"MSFT": 0.10, "CASH": 0.90},
+                "narrative_summary": f"{slug}: mixed conviction.",
+            })
+        with pytest.raises(Round1ParseError, match="requires 'thesis_status'"):
+            capture_round1_stances(
+                debate, results,
                 raw_round1_replies=replies,
                 config=self._cfg,
             )
