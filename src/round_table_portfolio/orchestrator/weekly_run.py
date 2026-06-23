@@ -158,6 +158,12 @@ from round_table_portfolio.orchestrator.briefing_builder import (
     load_briefing_config,
 )
 
+# M6 Component 12 extension — consensus book loader (TASK-M6-003).
+from round_table_portfolio.orchestrator.consensus_book import (
+    ConsensusBookResult,
+    load_current_consensus_book,
+)
+
 # Component 19 — real implementation (TASK-M2-009).
 from round_table_portfolio.orchestrator.metrics import (
     RunMetricsReport,    # noqa: F401 — shape used by tests
@@ -548,6 +554,9 @@ class WeeklyRunResult:
     # M4: per-persona briefing results from step-0 read-before-dispatch.
     # Empty dict on first week (cold-start) or when memory dir has no files yet.
     briefings: dict[str, BriefingResult] = field(default_factory=dict)
+    # M6 Component 12: consensus book loaded at step-0c (alongside M4 briefings).
+    # None only in legacy/test paths that pre-date M6; always populated by run_weekly.
+    consensus_book: Optional[ConsensusBookResult] = None
     # M5 Component 38: summary of the post-commit snapshot capture step.
     # None only when the capture step was skipped (e.g. no shortlist tickers).
     capture_summary: Optional[CaptureSummary] = None
@@ -740,6 +749,37 @@ def run_weekly(
         project,
         len(_briefings),
         _runs_dir / f"{week_label}-memory",
+    )
+
+    # ------------------------------------------------------------------
+    # 0c. M6 read-before-dispatch: load the latest committed consensus book
+    #     and render the current-book context block for session injection.
+    #
+    #     PRE-TRANSACTION and READ-ONLY (same invariant as step 0b):
+    #     — uses the same read-only connection opened above (already closed;
+    #       re-open a fresh one for this query, close before any write)
+    #     — commit-before-reveal boundary: SQL WHERE week_id != current week
+    #       guarantees no current-week agent_stances can leak (they don't
+    #       exist yet — Round 1 has not run)
+    # ------------------------------------------------------------------
+    _book_read_conn = sqlite3.connect(str(_db))
+    try:
+        _consensus_book = load_current_consensus_book(
+            _book_read_conn,
+            current_week_id=week_label,
+            user_id=user_id,
+            runs_dir=_runs_dir,
+            persist=True,
+        )
+    finally:
+        _book_read_conn.close()
+
+    logger.info(
+        "[%s] Step-0c consensus book loaded: prior_week=%s tickers=%d block_chars=%d",
+        project,
+        _consensus_book.week_set,
+        len(_consensus_book.holdings),
+        len(_consensus_book.block_text),
     )
 
     # Build the resolved_alpha map for the post-commit write-back (Component 18b).
@@ -957,10 +997,17 @@ def run_weekly(
     # ------------------------------------------------------------------
     # 6. Materialize portfolios (Component 15) using the FINAL consensus weights.
     # ------------------------------------------------------------------
+    # M6: wire the prior consensus book into action derivation.
+    # prior_portfolios maps portfolio-type → prior weights dict (including CASH).
+    # On week one _consensus_book.holdings is {}, so all positions become 'add' —
+    # same behaviour as prior_portfolios=None (no regression).
+    _prior_portfolios: dict[str, dict[str, float]] = (
+        {"consensus": _consensus_book.holdings} if _consensus_book.holdings else {}
+    )
     portfolio_payloads = materialize_portfolios(
         round1.counterfactuals,
         final_weights,
-        prior_portfolios=None,   # first week — no prior; M4+ will supply this
+        prior_portfolios=_prior_portfolios,
         week_id=week_label,
         entry_date=run_date,
         config={
@@ -1165,5 +1212,6 @@ def run_weekly(
         provisional_weights=provisional_weights,
         persona_results=persona_results,
         briefings=_briefings,
+        consensus_book=_consensus_book,
         capture_summary=_capture_summary,
     )

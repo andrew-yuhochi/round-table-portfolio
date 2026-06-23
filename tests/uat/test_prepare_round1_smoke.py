@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from round_table_portfolio.storage.apply_schema import apply_schema
 
 # ---------------------------------------------------------------------------
 # Import the driver module (same loader pattern as the existing smoke test).
@@ -222,6 +225,11 @@ def prep_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         json.dumps(persona_replies), encoding="utf-8"
     )
 
+    # prepare-round1 now emits consensus_book.md by opening state/ledger.db.
+    # Seed an empty (schema-only, no prior consensus) ledger so the week-one
+    # path runs without crashing.
+    apply_schema(db_path=state_root / "ledger.db")
+
     # Patch _PROJECT_ROOT so the driver reads real config/ files.
     monkeypatch.setattr(_driver_mod, "_PROJECT_ROOT", _PROJECT_ROOT)
 
@@ -278,7 +286,14 @@ class TestPrepareRound1:
         )
 
     def test_no_side_effects_in_real_state(self, prep_env: dict) -> None:
-        """prepare-round1 must write NOTHING into real state/ except debate_set.json."""
+        """prepare-round1 must write NOTHING into real state/ except known outputs.
+
+        Known outputs after M6-003 fix-forward:
+          - runs/<week>.debate_set.json       (debate set)
+          - runs/<week>-memory/consensus_book.md  (emitted for Round-1 injection)
+
+        The persona_replies.json is pre-existing input (written by the fixture).
+        """
         state_root = prep_env["state_root"]
 
         run_prepare_round1(prep_env["week"], state_root)
@@ -288,11 +303,15 @@ class TestPrepareRound1:
             p for p in state_root.rglob("*")
             if p.is_file()
         ]
-        # The ONLY allowed file is runs/<week>.debate_set.json.
-        # Also allow runs/<week>.persona_replies.json (written by the fixture).
+        # Allow: debate_set.json (primary output), persona_replies.json (pre-existing
+        # fixture input), consensus_book.md (M6-003 fix: emitted for Round-1 injection),
+        # and ledger.db (created by prep_env for the book emission call).
+        memory_dir = prep_env["runs_dir"] / f"{WEEK_ID}-memory"
         allowed = {
             prep_env["runs_dir"] / f"{WEEK_ID}.debate_set.json",
             prep_env["runs_dir"] / f"{WEEK_ID}.persona_replies.json",
+            memory_dir / "consensus_book.md",
+            state_root / "ledger.db",
         }
         unexpected = [p for p in all_files if p not in allowed]
         assert not unexpected, (
@@ -334,3 +353,171 @@ class TestPrepareRound1:
             assert isinstance(entry["report_excerpt"], str), (
                 f"digest[{slug!r}]['report_excerpt'] must be a string."
             )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for consensus_book emission tests (M6-003 fix-forward)
+# ---------------------------------------------------------------------------
+
+
+def _seed_consensus_week(
+    db_path: Path,
+    week_id: str,
+    tickers: list[str],
+    equity_weight: float = 0.15,
+    cash_weight: float = 0.55,
+    user_id: str = "andrew",
+) -> None:
+    """Seed a committed consensus portfolio + holdings into db_path for week_id."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("BEGIN")
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO roster_versions (roster_version, description) "
+            "VALUES (1, 'seed')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO enhancement_versions (enhancement_version, description) "
+            "VALUES (1, 'seed')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO weeks (week_id, run_date, notes, user_id) "
+            "VALUES (?, '2026-01-01', 'seeded', ?)",
+            (week_id, user_id),
+        )
+        conn.execute(
+            "INSERT INTO portfolios "
+            "(week_id, type, user_id, roster_version, enhancement_version, created_at) "
+            "VALUES (?, 'consensus', ?, 1, 1, '2026-01-01T00:00:00Z')",
+            (week_id, user_id),
+        )
+        port_id = conn.execute(
+            "SELECT portfolio_id FROM portfolios "
+            "WHERE week_id=? AND type='consensus' AND user_id=?",
+            (week_id, user_id),
+        ).fetchone()[0]
+        for ticker in tickers:
+            conn.execute(
+                "INSERT INTO holdings "
+                "(portfolio_id, ticker, weight, action, entry_date, user_id, roster_version) "
+                "VALUES (?, ?, ?, 'add', ?, ?, 1)",
+                (port_id, ticker, equity_weight, week_id, user_id),
+            )
+        conn.execute(
+            "INSERT INTO holdings "
+            "(portfolio_id, ticker, weight, action, entry_date, user_id, roster_version) "
+            "VALUES (?, 'CASH', ?, 'hold', ?, ?, 1)",
+            (port_id, cash_weight, week_id, user_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# TestConsensusbookEmissionAtPrepareRound1 (M6-003 fix-forward)
+# ---------------------------------------------------------------------------
+
+
+class TestConsensusbookEmissionAtPrepareRound1:
+    """Validates that prepare-round1 emits consensus_book.md before Round-1 dispatch.
+
+    Root cause (TASK-M6-003 follow-up): the book was only generated inside
+    run_weekly() at Stage 6–7 (preview/commit), so it was never available when
+    the session dispatched Round-1 persona subagents at Stage 3.  The fix emits
+    it from prepare-round1 — the last driver step before Stage 3.
+
+    Coverage:
+      1. consensus_book_written         — file exists at <week>-memory/consensus_book.md
+      2. week_one_file_written          — week-one note written when no prior consensus
+      3. prior_tickers_in_book          — prior-week tickers appear in emitted file
+      4. commit_before_reveal_at_prep   — current-week row excluded; prior-week row used
+    """
+
+    @pytest.fixture()
+    def env_with_ledger(self, prep_env: dict) -> dict:
+        """prep_env already seeds an empty ledger (week-one path). Return as-is."""
+        return prep_env
+
+    @pytest.fixture()
+    def env_with_prior(self, prep_env: dict) -> dict:
+        """Extend prep_env's already-created ledger with a prior consensus week."""
+        db_path = prep_env["state_root"] / "ledger.db"
+        _seed_consensus_week(db_path, "2026-W98", ["NVDA", "MSFT", "AAPL"])
+        return prep_env
+
+    def test_consensus_book_written(self, env_with_ledger: dict) -> None:
+        """consensus_book.md must exist at <week>-memory/ after prepare-round1."""
+        run_prepare_round1(env_with_ledger["week"], env_with_ledger["state_root"])
+
+        expected = (
+            env_with_ledger["runs_dir"]
+            / f"{WEEK_ID}-memory"
+            / "consensus_book.md"
+        )
+        assert expected.exists(), (
+            f"consensus_book.md not found at {expected} — "
+            "prepare-round1 must emit it so the session can inject it at Round-1 dispatch"
+        )
+
+    def test_week_one_file_written(self, env_with_ledger: dict) -> None:
+        """With no prior consensus, prepare-round1 emits the week-one note (no crash)."""
+        run_prepare_round1(env_with_ledger["week"], env_with_ledger["state_root"])
+
+        book_path = (
+            env_with_ledger["runs_dir"]
+            / f"{WEEK_ID}-memory"
+            / "consensus_book.md"
+        )
+        assert book_path.exists(), "consensus_book.md must be written even on week one"
+        content = book_path.read_text(encoding="utf-8")
+        # The week-one note is the explicit sentinel (not empty, not a ticker table).
+        assert len(content) > 0, "consensus_book.md must not be empty on week one"
+
+    def test_prior_tickers_in_book(self, env_with_prior: dict) -> None:
+        """Prior-week tickers appear in the emitted consensus_book.md."""
+        run_prepare_round1(env_with_prior["week"], env_with_prior["state_root"])
+
+        book_path = (
+            env_with_prior["runs_dir"]
+            / f"{WEEK_ID}-memory"
+            / "consensus_book.md"
+        )
+        assert book_path.exists()
+        content = book_path.read_text(encoding="utf-8")
+        for ticker in ("NVDA", "MSFT", "AAPL", "CASH"):
+            assert ticker in content, (
+                f"Prior-week ticker {ticker} missing from consensus_book.md"
+            )
+
+    def test_commit_before_reveal_at_prepare_round1(self, prep_env: dict) -> None:
+        """Current-week consensus row is excluded; prior-week row is used.
+
+        Seeds both W98 (prior) and WEEK_ID (current — simulating a pre-existing
+        run) so the SQL guard in load_current_consensus_book is exercised at the
+        prepare-round1 call site.
+        """
+        db_path = prep_env["state_root"] / "ledger.db"  # already created by prep_env
+        _seed_consensus_week(db_path, "2026-W98", ["NVDA", "MSFT"])
+        # Current-week row — must be excluded by the commit-before-reveal guard.
+        _seed_consensus_week(db_path, WEEK_ID, ["TSLA", "META"])
+
+        run_prepare_round1(prep_env["week"], prep_env["state_root"])
+
+        book_path = (
+            prep_env["runs_dir"]
+            / f"{WEEK_ID}-memory"
+            / "consensus_book.md"
+        )
+        assert book_path.exists()
+        content = book_path.read_text(encoding="utf-8")
+
+        # Prior-week tickers must appear; current-week tickers must not.
+        assert "NVDA" in content, "Prior-week NVDA missing from book"
+        assert "MSFT" in content, "Prior-week MSFT missing from book"
+        assert "TSLA" not in content, "Current-week TSLA leaked into book (commit-before-reveal violated)"
+        assert "META" not in content, "Current-week META leaked into book (commit-before-reveal violated)"

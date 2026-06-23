@@ -99,6 +99,7 @@ from round_table_portfolio.research.runner import run_persona_research
 from round_table_portfolio.orchestrator.round1 import construct_debate_set
 from round_table_portfolio.orchestrator.counterargument import load_counterargument_config
 from round_table_portfolio.orchestrator.round2 import parse_round2_reply
+from round_table_portfolio.orchestrator.consensus_book import load_current_consensus_book
 
 # ---------------------------------------------------------------------------
 # Default week
@@ -278,6 +279,29 @@ def run_prepare_round1(week: str, state_root: Path) -> None:
         json.dumps(debate_set_payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+    # Emit consensus_book.md so the session can inject it at Round-1 dispatch.
+    # Must run BEFORE the session reads the printed output and dispatches personas —
+    # prepare-round1 is the last driver step before Stage 3 (Round-1 dispatch).
+    # Uses the real ledger (state/ledger.db); commit-before-reveal is enforced by
+    # SQL WHERE week_id != current_week_id inside load_current_consensus_book.
+    _real_db = state_root / "ledger.db"
+    _book_conn = sqlite3.connect(str(_real_db))
+    try:
+        _book = load_current_consensus_book(
+            _book_conn,
+            current_week_id=week,
+            runs_dir=runs_dir,
+            persist=True,
+        )
+    finally:
+        _book_conn.close()
+
+    if _book.week_set is not None:
+        _book_note = f"consensus_book: {len(_book.holdings)} tickers from {_book.week_set}"
+    else:
+        _book_note = "consensus_book: week-one — no prior consensus (note written)"
+    print(f"  {_book_note}")
 
     # Print the debate set summary and the Round-1 reply schema contract.
     print(f"\n{'='*62}")

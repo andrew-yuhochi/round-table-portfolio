@@ -585,10 +585,10 @@ class TestPerWeekTranscripts:
             bdir = full_run_result.briefing_dirs[week_id]
             assert bdir is not None
             assert bdir.exists(), f"Briefing dir missing for {week_id}: {bdir}"
-            # 7 briefing files under the dir
+            # 7 persona briefing files + consensus_book.md (M6) under the dir.
             bf_files = list(bdir.glob("*.md"))
-            assert len(bf_files) == 7, (
-                f"Expected 7 briefing files for {week_id}, got {len(bf_files)}"
+            assert len(bf_files) >= 7, (
+                f"Expected >= 7 briefing files for {week_id}, got {len(bf_files)}"
             )
 
     def test_founder_transcripts_present(self, full_run_result: HarnessResult) -> None:

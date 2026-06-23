@@ -337,13 +337,18 @@ class TestStepZeroOrdering:
     def test_briefing_files_exist_after_run(
         self, base_run_env: dict
     ) -> None:
-        """After a run, 7 briefing files must exist under state/runs/<week>-memory/."""
+        """After a run, 7 persona briefing files + consensus_book.md must exist
+        under state/runs/<week>-memory/ (M6 adds consensus_book.md as a sibling)."""
         result = _run_one_week("2026-W24", base_run_env)
         briefing_dir = base_run_env["state_root"] / "runs" / "2026-W24-memory"
         assert briefing_dir.exists(), f"Briefing directory missing: {briefing_dir}"
-        written = sorted(f.stem for f in briefing_dir.glob("*.md"))
-        assert written == sorted(PERSONA_SLUGS_7), (
-            f"Expected 7 briefing files, got: {written}"
+        written_stems = {f.stem for f in briefing_dir.glob("*.md")}
+        # All 7 persona briefing files must be present.
+        for slug in PERSONA_SLUGS_7:
+            assert slug in written_stems, f"Missing briefing file for {slug}"
+        # M6: consensus_book.md must also be present.
+        assert "consensus_book" in written_stems, (
+            "consensus_book.md missing from briefing directory"
         )
 
     def test_briefing_result_in_weekly_run_result(
@@ -381,9 +386,11 @@ class TestStepZeroOrdering:
         original_run = _orch.run_persona_research
 
         def _spy_research(*args: Any, **kwargs: Any) -> Any:
-            # Record whether briefing_dir already contains the 7 files.
+            # Record whether briefing_dir already contains the 7 persona files.
+            # M6 adds consensus_book.md as an 8th sibling — check >= 7 so the
+            # ordering assertion is not sensitive to the exact count.
             files = list(briefing_dir.glob("*.md")) if briefing_dir.exists() else []
-            observations.append(len(files) == 7)
+            observations.append(len(files) >= 7)
             return original_run(*args, **kwargs)
 
         monkeypatch.setattr(_orch, "run_persona_research", _spy_research)
@@ -779,16 +786,16 @@ class TestRollbackSafety:
         """
         briefing_dir = base_run_env["state_root"] / "runs" / "2026-W24-memory"
 
-        # First run: produces 7 briefing files.
+        # First run: produces 7 persona briefing files + consensus_book.md (M6).
         _run_one_week("2026-W24", base_run_env)
         assert briefing_dir.exists()
         first_mtimes = {
             f.stem: f.stat().st_mtime for f in briefing_dir.glob("*.md")
         }
-        assert len(first_mtimes) == 7
+        assert len(first_mtimes) >= 7, f"Expected >= 7 briefing files, got {len(first_mtimes)}"
 
-        # Second run: same week_id → transaction rolls back, BUT step-0b
-        # (briefing write) ran first.  The briefing files are regenerated.
+        # Second run: same week_id → transaction rolls back, BUT step-0b/0c
+        # (briefing + consensus_book write) ran first.  The files are regenerated.
         with pytest.raises(Exception):
             _run_one_week("2026-W24", base_run_env)
 
@@ -796,7 +803,7 @@ class TestRollbackSafety:
         second_mtimes = {
             f.stem: f.stat().st_mtime for f in briefing_dir.glob("*.md")
         }
-        assert len(second_mtimes) == 7, "Expected 7 briefing files after second run"
+        assert len(second_mtimes) >= 7, f"Expected >= 7 briefing files after second run, got {len(second_mtimes)}"
 
     def test_rollback_does_not_leave_ledger_half_written(
         self, base_run_env: dict
